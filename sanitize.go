@@ -307,7 +307,7 @@ func unsafeRune(r rune) bool {
 	switch r {
 	case '\n', '\r', '\t':
 		return false // valid TOON escapes; toon-go handles these correctly
-	case ' ', ' ':
+	case '\u2028', '\u2029':
 		return true
 	}
 	return unicode.IsControl(r)
