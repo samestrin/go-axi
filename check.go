@@ -123,6 +123,29 @@ var tabularHeader = regexp.MustCompile(`(?m)^\s*[^\[\]{}:]*\[\d+[^\]]*\]\{[^}]*\
 // `json:"x"` encodes under its Go field name and the two projections disagree
 // for reasons that have nothing to do with data loss.
 func Check(v any) Verdict {
+	// Sanitize is also the cycle and key-collision guard: it refuses a
+	// self-referential value with *CycleError, so a cycle is caught here rather
+	// than reaching toon.Marshal, where stack exhaustion would kill the process
+	// unrecoverably.
+	//
+	// Check used to run its own hasCycle pass first. That became redundant when
+	// Sanitize gained the guard in v0.1.1, and meant one call detected the same
+	// cycle twice — duplication atcr's review flagged.
+	clean, err := Sanitize(v)
+	if err != nil {
+		return Verdict{Tier: TierLossy, Reason: err.Error()}
+	}
+	return CheckSanitized(v, clean)
+}
+
+// CheckSanitized is Check for a value that has already been sanitized, so a
+// caller holding the cleaned copy does not pay to sanitize it twice.
+//
+// v supplies the declared types for the loss walks; clean is what gets measured.
+// Passing both is deliberate — sanitizing preserves concrete types, so the walks
+// give the same answer either way, but the measurements must be taken on what
+// will actually be emitted.
+func CheckSanitized(v any, clean any) Verdict {
 	// Two walks, because neither alone is sufficient. The type walk catches a
 	// lossy type declared in an empty or nil container, which holds no values to
 	// inspect. The value walk catches a lossy type reaching an `any` field,
@@ -134,34 +157,12 @@ func Check(v any) Verdict {
 		return Verdict{Tier: TierLossy, Reason: reason}
 	}
 
-	// Cycles must be caught BEFORE toon.Marshal. A reference cycle exhausts the
-	// stack inside the encoder, and stack exhaustion is a fatal runtime error in
-	// Go — recover() cannot catch it, so the whole process dies with a stack
-	// dump and no diagnostic. encoding/json reports a clean error for the same
-	// input; toon-go does not. Verified by an isolated probe.
-	if hasCycle(reflect.ValueOf(v), map[uintptr]bool{}, 0) {
-		return Verdict{
-			Tier: TierLossy,
-			Reason: "value contains a reference cycle; TOON cannot represent one, " +
-				"and encoding it would exhaust the stack and kill the process",
-		}
-	}
-
-	// Everything below measures the SANITIZED value, because that is what Encode
-	// actually emits. Judging the raw value instead made Check contradict Encode:
-	// a string carrying an ANSI escape makes toon.Marshal fail, so Check called a
-	// perfectly good value lossy — and reported "declare it as a type alias",
-	// advice with nothing to do with the real cause. EncodeOrJSON then routed on
-	// that verdict and emitted a JSON envelope for a value TOON handles fine.
-	//
-	// Sanitizing must come after the cycle guard above. Sanitize walks the value
-	// without cycle protection of its own, so a cyclic input would exhaust the
-	// stack here rather than be refused.
-	clean, sErr := Sanitize(v)
-	if sErr != nil {
-		return Verdict{Tier: TierLossy, Reason: sErr.Error()}
-	}
-
+	// Measurements are taken on the SANITIZED value, because that is what Encode
+	// emits. Judging the raw value made Check contradict Encode: a string with an
+	// ANSI escape makes toon.Marshal fail, so Check called a perfectly good value
+	// lossy — and advised "declare it as a type alias", which had nothing to do
+	// with the cause. EncodeOrJSON then routed on that verdict and emitted a JSON
+	// envelope for a value TOON handles fine.
 	b, err := toon.Marshal(clean)
 	if err != nil {
 		return Verdict{
@@ -174,7 +175,7 @@ func Check(v any) Verdict {
 	// Empty output is the correct answer for an empty input, and a fault for
 	// anything else. Reporting every zero-length payload as broken would cry
 	// wolf on legitimately empty results, which AXI asks to be stated plainly.
-	if len(b) == 0 && !encodesToNothing(clean) {
+	if len(b) == 0 && !jsonProjectionIsEmpty(clean) {
 		return Verdict{
 			Tier:   TierLossy,
 			Reason: "encoder produced empty output for a non-empty value",
@@ -210,6 +211,15 @@ func CanEncode(v any) bool { return Check(v).OK }
 //
 // The seen set makes recursive types terminate. Memoizing by type is sound here
 // precisely because this walk never consults a value.
+//
+// This and lossyInValue look near-identical and must NOT be merged into one
+// walker, which atcr's review raised. They differ in the one place that matters:
+// this walk memoizes by type and lossyInValue cannot, because the same static
+// type (`interface{}`) holds a different dynamic value at every position. A
+// shared walker is exactly the bug that shipped once — one seen set covering
+// both walks marked `interface{}` visited during the type pass, so every dynamic
+// element in a []any was skipped and a TextMarshaler inside a slice or map went
+// undetected. The duplication is the fix, not an oversight.
 func lossyInType(t reflect.Type, seen map[reflect.Type]bool) string {
 	if t == nil || seen[t] {
 		return ""
@@ -347,6 +357,19 @@ func hasCycle(v reflect.Value, seen map[uintptr]bool, depth int) bool {
 	case reflect.Map:
 		iter := v.MapRange()
 		for iter.Next() {
+			// KEYS are walked as well as values, and that is load-bearing. A map
+			// key can be a pointer, and a pointer is comparable regardless of
+			// what it points at, so a cycle can close entirely through keys.
+			//
+			// sanitizeValue recurses into keys with no seen-set of its own, so a
+			// key-reachable cycle that this pre-check misses is not merely
+			// undetected — it exhausts the stack and kills the process, which
+			// recover() cannot catch. Reproduced exactly that way before this
+			// line existed. The pre-check and the walker must traverse identical
+			// edges or the guard is a fiction.
+			if hasCycle(iter.Key(), seen, depth+1) {
+				return true
+			}
 			if hasCycle(iter.Value(), seen, depth+1) {
 				return true
 			}
@@ -381,7 +404,7 @@ func hasCycle(v reflect.Value, seen map[uintptr]bool, depth int) bool {
 	}
 }
 
-// encodesToNothing reports whether v genuinely has nothing to emit, so empty
+// jsonProjectionIsEmpty reports whether v genuinely has nothing to emit, so empty
 // output is the correct answer rather than a fault.
 //
 // The question is asked of the JSON projection rather than by counting struct
@@ -394,7 +417,7 @@ func hasCycle(v reflect.Value, seen map[uintptr]bool, depth int) bool {
 // both encoders honour omitempty identically (verified by probe). A
 // TextMarshaler would fool this test, but it is already rejected by the two
 // lossy walks before this point is reached.
-func encodesToNothing(v any) bool {
+func jsonProjectionIsEmpty(v any) bool {
 	if v == nil {
 		return true
 	}

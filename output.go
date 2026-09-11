@@ -38,11 +38,7 @@ func Encode(w io.Writer, v any) error {
 	if err != nil {
 		return err
 	}
-	b, err := toon.Marshal(clean)
-	if err != nil {
-		return fmt.Errorf("goaxi: encoding TOON: %w", err)
-	}
-	return writeLine(w, b)
+	return encodeSanitized(w, clean)
 }
 
 // EncodeOrJSON writes v as TOON when that is lossless, and otherwise falls back
@@ -57,24 +53,26 @@ func Encode(w io.Writer, v any) error {
 // cadence should keep its build-time guards and simply not call it. It exists
 // for callers that have no such rule.
 func EncodeOrJSON(w io.Writer, v any) error {
-	verdict := Check(v)
-	if verdict.OK {
-		return Encode(w, v)
-	}
-
-	// The fallback sanitizes too. An earlier version put the raw value straight
-	// into the envelope, so the JSON path emitted the very control bytes the
-	// TOON path strips — the escape hatch defeated the sanitizer.
+	// Sanitized ONCE, for both the routing decision and whichever payload wins.
+	// This used to call Check (which sanitizes internally) and then Encode (which
+	// sanitizes again), so the OK path cleaned the same value twice for no
+	// correctness benefit — a finding from atcr's review.
 	//
-	// Sanitize refuses a cyclic value with *CycleError instead of exhausting the
-	// stack, so its error is simply propagated. This used to pre-check hasCycle
-	// to route around a crash that no longer happens, which meant one call
-	// detected the same cycle three times: here, in Check, and inside Sanitize.
+	// Sanitize is also the cycle and key-collision guard, so its error is simply
+	// propagated rather than pre-checked.
 	clean, err := Sanitize(v)
 	if err != nil {
 		return err
 	}
 
+	verdict := CheckSanitized(v, clean)
+	if verdict.OK {
+		return encodeSanitized(w, clean)
+	}
+
+	// The fallback carries the SANITIZED payload. An earlier version put the raw
+	// value straight into the envelope, so the JSON path emitted the very control
+	// bytes the TOON path strips — the escape hatch defeated the sanitizer.
 	b, err := json.Marshal(envelope{
 		Format: formatJSON,
 		Notice: verdict.Reason,
@@ -82,6 +80,16 @@ func EncodeOrJSON(w io.Writer, v any) error {
 	})
 	if err != nil {
 		return fmt.Errorf("goaxi: encoding JSON fallback: %w", err)
+	}
+	return writeLine(w, b)
+}
+
+// encodeSanitized marshals an already-sanitized value and writes it. Split out
+// so a caller holding the cleaned copy does not sanitize it a second time.
+func encodeSanitized(w io.Writer, clean any) error {
+	b, err := toon.Marshal(clean)
+	if err != nil {
+		return fmt.Errorf("goaxi: encoding TOON: %w", err)
 	}
 	return writeLine(w, b)
 }

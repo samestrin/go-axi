@@ -259,12 +259,31 @@ func sanitizeValue(v reflect.Value) (reflect.Value, error) {
 // genuine U+FFFD in the input from an invalid byte decoded as one. A lone 0x9b
 // must be dropped; a real replacement character the caller supplied must not be.
 func cleanString(s string) string {
-	if isClean(s) {
-		return s
+	// One pass. Scan until the first byte that has to go, and only then allocate
+	// and copy. A clean string — the common case by far — is walked exactly once
+	// and returns itself.
+	//
+	// The previous version asked isClean first, which cost a full utf8.ValidString
+	// scan plus a full range loop, then scanned a third time to rebuild a dirty
+	// string. atcr's review flagged it as a double scan; it was worse than that.
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || unsafeRune(r) {
+			return cleanFrom(s, i)
+		}
+		i += size
 	}
+	return s
+}
+
+// cleanFrom builds the cleaned result for a string already known to be dirty at
+// byte offset i. The prefix before i has been verified clean, so it is copied
+// wholesale rather than re-examined rune by rune.
+func cleanFrom(s string, i int) string {
 	var b strings.Builder
 	b.Grow(len(s))
-	for i := 0; i < len(s); {
+	b.WriteString(s[:i])
+	for i < len(s) {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
 			i++ // invalid byte: drop it
@@ -276,20 +295,6 @@ func cleanString(s string) string {
 		i += size
 	}
 	return b.String()
-}
-
-// isClean reports whether s needs no changes, so the common case returns the
-// original string without allocating.
-func isClean(s string) bool {
-	if !utf8.ValidString(s) {
-		return false
-	}
-	for _, r := range s {
-		if unsafeRune(r) {
-			return false
-		}
-	}
-	return true
 }
 
 // unsafeRune reports whether r must not reach TOON output.
