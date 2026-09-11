@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"reflect"
 
 	toon "github.com/toon-format/toon-go"
 )
@@ -67,23 +66,19 @@ func EncodeOrJSON(w io.Writer, v any) error {
 	// into the envelope, so the JSON path emitted the very control bytes the
 	// TOON path strips — the escape hatch defeated the sanitizer.
 	//
-	// A cyclic value is the exception: Sanitize has no cycle guard and would
-	// exhaust the stack, while encoding/json detects the cycle and returns a
-	// clean error. So a cycle goes to json.Marshal unsanitized and fails safely
-	// there rather than crashing here.
-	data := v
-	if !hasCycle(reflect.ValueOf(v), map[uintptr]bool{}, 0) {
-		clean, err := Sanitize(v)
-		if err != nil {
-			return err
-		}
-		data = clean
+	// Sanitize refuses a cyclic value with *CycleError instead of exhausting the
+	// stack, so its error is simply propagated. This used to pre-check hasCycle
+	// to route around a crash that no longer happens, which meant one call
+	// detected the same cycle three times: here, in Check, and inside Sanitize.
+	clean, err := Sanitize(v)
+	if err != nil {
+		return err
 	}
 
 	b, err := json.Marshal(envelope{
 		Format: formatJSON,
 		Notice: verdict.Reason,
-		Data:   data,
+		Data:   clean,
 	})
 	if err != nil {
 		return fmt.Errorf("goaxi: encoding JSON fallback: %w", err)
