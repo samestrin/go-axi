@@ -123,16 +123,30 @@ func WriteHelp(w io.Writer, lines []string) error {
 	return writeLine(w, b)
 }
 
-// writeLine writes b followed by exactly one newline, adding one only when the
-// encoder did not. Encoders disagree about trailing newlines, and a caller
-// appending a help block to a body needs the boundary to be predictable.
+// writeLine writes b terminated by exactly one newline, in a SINGLE Write call.
+//
+// Encoders disagree about trailing newlines, and a caller appending a help block
+// to a body needs the boundary to be predictable.
+//
+// The single write is the point. This used to write the body and then the
+// newline separately, which left a window where the body landed and the
+// terminator did not — against a closed pipe the consumer receives a payload
+// missing its last byte and parses it happily. One write either lands or fails;
+// there is no half-written state for a consumer to misread.
+//
+// An empty body writes nothing rather than a bare newline. A command with no
+// payload should be silent, not emit a blank line an agent pays tokens to read.
 func writeLine(w io.Writer, b []byte) error {
-	if _, err := w.Write(b); err != nil {
-		return err
-	}
-	if len(b) > 0 && b[len(b)-1] == '\n' {
+	if len(b) == 0 {
 		return nil
 	}
-	_, err := io.WriteString(w, "\n")
+	if b[len(b)-1] == '\n' {
+		_, err := w.Write(b)
+		return err
+	}
+	out := make([]byte, 0, len(b)+1)
+	out = append(out, b...)
+	out = append(out, '\n')
+	_, err := w.Write(out)
 	return err
 }

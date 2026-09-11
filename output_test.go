@@ -288,19 +288,16 @@ type failingWriter struct{ err error }
 
 func (f failingWriter) Write([]byte) (int, error) { return 0, f.err }
 
-// nthFailWriter succeeds until the nth write, then fails. It exists to reach the
-// trailing-newline write specifically, which is a separate call from the body.
-type nthFailWriter struct {
-	failOn int
-	seen   int
-	err    error
+// countingWriter records how many times Write was called, so a test can pin
+// that output lands in exactly one call rather than two.
+type countingWriter struct {
+	writes int
+	n      int
 }
 
-func (w *nthFailWriter) Write(p []byte) (int, error) {
-	w.seen++
-	if w.seen >= w.failOn {
-		return 0, w.err
-	}
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	w.n += len(p)
 	return len(p), nil
 }
 
@@ -330,12 +327,51 @@ func TestWriteErrorsPropagate(t *testing.T) {
 				t.Errorf("a failed body write must propagate, got %v", err)
 			}
 		})
-		t.Run(c.name+" newline write", func(t *testing.T) {
-			w := &nthFailWriter{failOn: 2, err: boom}
-			if err := c.call(w); !errors.Is(err, boom) {
-				t.Errorf("a failed trailing-newline write must propagate, got %v", err)
+		// Stronger than the subtest this replaces, which asserted that a SECOND
+		// write could fail. The body and its terminator now go out together, so
+		// there is no second write to fail — and no window where a consumer sees
+		// a payload whose last byte never arrived.
+		t.Run(c.name+" writes exactly once", func(t *testing.T) {
+			w := &countingWriter{}
+			if err := c.call(w); err != nil {
+				t.Fatalf("call must succeed against a working writer: %v", err)
+			}
+			if w.writes != 1 {
+				t.Errorf("output must land in exactly 1 Write call, got %d", w.writes)
+			}
+			if w.n == 0 {
+				t.Error("something must actually be written")
 			}
 		})
+	}
+}
+
+// A body that already ends in a newline must not gain a second one. toon-go does
+// not emit trailing newlines today, so nothing exercises this in practice — but
+// the contract is "exactly one", and an encoder change should not silently
+// double-terminate every payload in every consumer.
+func TestWriteLine_AlreadyTerminatedBodyIsNotDoubled(t *testing.T) {
+	const body = "f: x\n"
+	w := &countingWriter{}
+	if err := writeLine(w, []byte(body)); err != nil {
+		t.Fatalf("writeLine: %v", err)
+	}
+	if w.writes != 1 {
+		t.Errorf("must still be a single write, got %d", w.writes)
+	}
+	if w.n != len(body) {
+		t.Errorf("no extra byte may be appended: wrote %d bytes, want %d", w.n, len(body))
+	}
+}
+
+// An empty payload writes nothing at all, not a bare newline.
+func TestWriteLine_EmptyBodyWritesNothing(t *testing.T) {
+	w := &countingWriter{}
+	if err := writeLine(w, nil); err != nil {
+		t.Fatalf("writeLine: %v", err)
+	}
+	if w.writes != 0 || w.n != 0 {
+		t.Errorf("an empty body must write nothing, got %d write(s) of %d byte(s)", w.writes, w.n)
 	}
 }
 
