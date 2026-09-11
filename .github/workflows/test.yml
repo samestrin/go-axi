@@ -72,8 +72,21 @@ jobs:
       # projects depend on does not get that latitude.
       - name: Enforce 80% coverage
         run: |
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
-          echo "Total coverage: $COVERAGE%"
+          # A module with no coverable statements yields a coverage.out holding
+          # only its "mode:" line, while `go tool cover -func` still reports
+          # "total: 0.0%" — so the total alone cannot distinguish "scaffold with
+          # nothing to cover" from "real code with no tests". Count statement
+          # lines instead.
+          #
+          # This is NOT a loophole: any real code produces statement lines, so
+          # code with statements but no tests still reports 0.0% and fails below.
+          STMTS=$(grep -vc '^mode:' coverage.out || true)
+          if [ "${STMTS:-0}" -eq 0 ]; then
+            echo "No coverable statements yet; nothing to gate."
+            exit 0
+          fi
+          COVERAGE=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: $COVERAGE% across $STMTS statement lines"
           if (( $(echo "$COVERAGE < 80" | bc -l) )); then
             echo "::error::Coverage $COVERAGE% is below the required 80%"
             exit 1
