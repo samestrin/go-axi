@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 
 	toon "github.com/toon-format/toon-go"
 )
@@ -57,18 +58,37 @@ func Encode(w io.Writer, v any) error {
 // cadence should keep its build-time guards and simply not call it. It exists
 // for callers that have no such rule.
 func EncodeOrJSON(w io.Writer, v any) error {
-	if verdict := Check(v); !verdict.OK {
-		b, err := json.Marshal(envelope{
-			Format: formatJSON,
-			Notice: verdict.Reason,
-			Data:   v,
-		})
-		if err != nil {
-			return fmt.Errorf("goaxi: encoding JSON fallback: %w", err)
-		}
-		return writeLine(w, b)
+	verdict := Check(v)
+	if verdict.OK {
+		return Encode(w, v)
 	}
-	return Encode(w, v)
+
+	// The fallback sanitizes too. An earlier version put the raw value straight
+	// into the envelope, so the JSON path emitted the very control bytes the
+	// TOON path strips — the escape hatch defeated the sanitizer.
+	//
+	// A cyclic value is the exception: Sanitize has no cycle guard and would
+	// exhaust the stack, while encoding/json detects the cycle and returns a
+	// clean error. So a cycle goes to json.Marshal unsanitized and fails safely
+	// there rather than crashing here.
+	data := v
+	if !hasCycle(reflect.ValueOf(v), map[uintptr]bool{}, 0) {
+		clean, err := Sanitize(v)
+		if err != nil {
+			return err
+		}
+		data = clean
+	}
+
+	b, err := json.Marshal(envelope{
+		Format: formatJSON,
+		Notice: verdict.Reason,
+		Data:   data,
+	})
+	if err != nil {
+		return fmt.Errorf("goaxi: encoding JSON fallback: %w", err)
+	}
+	return writeLine(w, b)
 }
 
 // WriteHelp emits an AXI contextual-disclosure block: next-step command

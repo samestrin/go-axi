@@ -147,7 +147,22 @@ func Check(v any) Verdict {
 		}
 	}
 
-	b, err := toon.Marshal(v)
+	// Everything below measures the SANITIZED value, because that is what Encode
+	// actually emits. Judging the raw value instead made Check contradict Encode:
+	// a string carrying an ANSI escape makes toon.Marshal fail, so Check called a
+	// perfectly good value lossy — and reported "declare it as a type alias",
+	// advice with nothing to do with the real cause. EncodeOrJSON then routed on
+	// that verdict and emitted a JSON envelope for a value TOON handles fine.
+	//
+	// Sanitizing must come after the cycle guard above. Sanitize walks the value
+	// without cycle protection of its own, so a cyclic input would exhaust the
+	// stack here rather than be refused.
+	clean, sErr := Sanitize(v)
+	if sErr != nil {
+		return Verdict{Tier: TierLossy, Reason: sErr.Error()}
+	}
+
+	b, err := toon.Marshal(clean)
 	if err != nil {
 		return Verdict{
 			Tier: TierLossy,
@@ -159,7 +174,7 @@ func Check(v any) Verdict {
 	// Empty output is the correct answer for an empty input, and a fault for
 	// anything else. Reporting every zero-length payload as broken would cry
 	// wolf on legitimately empty results, which AXI asks to be stated plainly.
-	if len(b) == 0 && !encodesToNothing(v) {
+	if len(b) == 0 && !encodesToNothing(clean) {
 		return Verdict{
 			Tier:   TierLossy,
 			Reason: "encoder produced empty output for a non-empty value",
@@ -171,7 +186,7 @@ func Check(v any) Verdict {
 		verdict.Tier = TierTabular
 	}
 
-	jb, jerr := json.Marshal(v)
+	jb, jerr := json.Marshal(clean)
 	if jerr == nil {
 		verdict.Efficient = len(b) <= len(jb)
 		if !verdict.Efficient {

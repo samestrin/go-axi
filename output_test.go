@@ -213,6 +213,74 @@ func TestEncode_SanitizesAndTerminatesWithOneNewline(t *testing.T) {
 	}
 }
 
+// Hostile-review finding: Check judged the RAW value while Encode emitted the
+// SANITIZED one, so the two disagreed. A string carrying an ANSI escape makes
+// toon.Marshal fail, so Check called a fine value lossy and advised "declare it
+// as a type alias" — advice unrelated to the real cause — and EncodeOrJSON then
+// emitted a JSON envelope for a value TOON handles perfectly.
+func TestEncodeOrJSON_SanitizableValueStaysTOON(t *testing.T) {
+	v := map[string]any{"f": "\x1b[31mred\x1b[0m"}
+
+	if got := Check(v); !got.OK {
+		t.Errorf("a value that only needs sanitizing must not be reported lossy, got %q", got.Reason)
+	}
+
+	var b strings.Builder
+	if err := EncodeOrJSON(&b, v); err != nil {
+		t.Fatalf("EncodeOrJSON: %v", err)
+	}
+	if strings.HasPrefix(b.String(), "{") {
+		t.Errorf("a sanitizable value must stay TOON, got the envelope: %q", b.String())
+	}
+	if strings.Contains(b.String(), "\x1b") {
+		t.Errorf("the control byte must be stripped, got %q", b.String())
+	}
+}
+
+// The JSON fallback must sanitize its payload too. An escape hatch that emits
+// the bytes the main path strips is worse than no escape hatch, because it is
+// reached exactly when something already went wrong.
+func TestEncodeOrJSON_FallbackSanitizesItsData(t *testing.T) {
+	var b strings.Builder
+	err := EncodeOrJSON(&b, map[string]any{
+		"m":    textMarshaler{v: "x"},
+		"text": "bad\x1bhere",
+	})
+	if err != nil {
+		t.Fatalf("EncodeOrJSON: %v", err)
+	}
+	out := b.String()
+
+	if !strings.HasPrefix(out, `{"axi_format"`) {
+		t.Fatalf("expected the JSON envelope, got %q", out)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("the fallback must not leak a raw control byte, got %q", out)
+	}
+	// JSON escapes a control byte as  rather than emitting it raw; neither
+	// form may appear, since both put the sequence back together downstream.
+	if strings.Contains(out, ``) {
+		t.Errorf("the fallback must strip the control byte, not escape it, got %q", out)
+	}
+	if !strings.Contains(out, "badhere") {
+		t.Errorf("visible text must survive in the fallback, got %q", out)
+	}
+}
+
+// A cyclic value must fail safely rather than crash. Sanitize has no cycle
+// guard, so the fallback deliberately hands the raw value to encoding/json,
+// which detects the cycle and returns an error.
+func TestEncodeOrJSON_CyclicValueErrorsRatherThanCrashes(t *testing.T) {
+	m := map[string]any{"name": "root"}
+	m["self"] = m
+
+	var b strings.Builder
+	err := EncodeOrJSON(&b, m)
+	if err == nil {
+		t.Fatalf("a cyclic value must report an error, got output %q", b.String())
+	}
+}
+
 // --- write errors ----------------------------------------------------------
 
 // failingWriter fails every write.
