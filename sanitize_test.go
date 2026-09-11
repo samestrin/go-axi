@@ -49,8 +49,8 @@ func TestSanitize_StripsLineAndParagraphSeparators(t *testing.T) {
 		in   string
 		bad  rune
 	}{
-		{"U+2028 line separator", "end sep", ' '},
-		{"U+2029 paragraph separator", "end sep", ' '},
+		{"U+2028 line separator", "end\u2028sep", '\u2028'},
+		{"U+2029 paragraph separator", "end\u2029sep", '\u2029'},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -79,7 +79,7 @@ func TestSanitize_StripsC1Bytes(t *testing.T) {
 	}{
 		{"raw 0x9b (8-bit CSI)", "ab\x9bcd", []string{"ab", "cd"}},
 		{"raw 0x9d (8-bit OSC)", "ef\x9dgh", []string{"ef", "gh"}},
-		{"rune U+009B", "abcd", []string{"ab", "cd"}},
+		{"rune U+009B", "ab\u009bcd", []string{"ab", "cd"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -87,7 +87,7 @@ func TestSanitize_StripsC1Bytes(t *testing.T) {
 			if strings.ContainsAny(out, "\x9b\x9d") {
 				t.Errorf("raw C1 byte must not reach stdout, got %q", out)
 			}
-			if strings.ContainsRune(out, '') {
+			if strings.ContainsRune(out, '\u009b') {
 				t.Errorf("C1 codepoint must not reach stdout, got %q", out)
 			}
 			for _, want := range c.keep {
@@ -107,7 +107,7 @@ func TestSanitize_OutputIsAlwaysValidUTF8(t *testing.T) {
 		"\xfe\xff",
 		"ab\x9bcd",
 		"\x1b[0m",
-		"end sep",
+		"end\u2028sep",
 		"plain",
 	}
 	for _, in := range hostile {
@@ -166,7 +166,7 @@ func TestSanitize_RecursesIntoNestedValues(t *testing.T) {
 	v := map[string]any{
 		"rows": []any{
 			map[string]any{"name": "ok", "note": "bad\x1bhere"},
-			map[string]any{"name": "two x", "note": "fine"},
+			map[string]any{"name": "two\u2028x", "note": "fine"},
 		},
 		"top": "clean",
 	}
@@ -175,7 +175,7 @@ func TestSanitize_RecursesIntoNestedValues(t *testing.T) {
 	if strings.Contains(out, "\x1b") {
 		t.Errorf("ANSI escape nested in a slice-of-maps must be stripped, got %q", out)
 	}
-	if strings.ContainsRune(out, ' ') {
+	if strings.ContainsRune(out, '\u2028') {
 		t.Errorf("U+2028 nested in a slice-of-maps must be stripped, got %q", out)
 	}
 	for _, want := range []string{"badhere", "twox", "clean", "fine"} {
@@ -217,7 +217,7 @@ func TestSanitize_RoundTrips(t *testing.T) {
 	}{
 		{"plain", map[string]any{"f": "hello"}},
 		{"after ANSI strip", map[string]any{"f": "\x1b[31mred\x1b[0m"}},
-		{"after separator strip", map[string]any{"f": "end sep"}},
+		{"after separator strip", map[string]any{"f": "end\u2028sep"}},
 		{"after C1 strip", map[string]any{"f": "ab\x9bcd"}},
 		{"escaped whitespace", map[string]any{"f": "a\nb\tc"}},
 		{"delimiter in value", map[string]any{"f": "a|b,c"}},
