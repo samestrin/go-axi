@@ -3,6 +3,7 @@ package goaxi
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // Check exists because toon-go fails in ways neither an error nor a length test
@@ -109,6 +110,49 @@ func TestCheck_AcceptsTypeAliasWorkaround(t *testing.T) {
 	}
 }
 
+// time.Time implements TextMarshaler but toon-go special-cases it, encoding
+// `at: "2026-09-11T12:00:00Z"` rather than dropping the value. A detector that
+// flags every TextMarshaler would reject any payload carrying a timestamp —
+// which an earlier version of Check did, in a struct field but not in a map,
+// so it was inconsistent as well as wrong.
+func TestCheck_TimeTimeIsNotLossy(t *testing.T) {
+	when := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+
+	if got := Check(map[string]any{"at": when}); !got.OK {
+		t.Errorf("time.Time in a map must be OK, got reason %q", got.Reason)
+	}
+	if got := Check(struct {
+		At time.Time `toon:"at"`
+	}{At: when}); !got.OK {
+		t.Errorf("time.Time in a struct field must be OK, got reason %q", got.Reason)
+	}
+	if got := Check([]any{when}); !got.OK {
+		t.Errorf("time.Time in a slice must be OK, got reason %q", got.Reason)
+	}
+}
+
+// A lossy type declared inside an EMPTY container has no value to inspect, so
+// only the type walk can find it. Without that walk a command would pass its
+// guard whenever its test fixture happened to be empty, then lose data in
+// production once the list was populated.
+func TestCheck_FindsLossyTypeInEmptyContainer(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+	}{
+		{"empty typed slice", []textMarshaler{}},
+		{"nil typed slice", []textMarshaler(nil)},
+		{"empty typed map", map[string]textMarshaler{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Check(c.in); got.OK {
+				t.Errorf("a lossy element type must be detected even when the container is empty, got OK")
+			}
+		})
+	}
+}
+
 // --- Empty output ----------------------------------------------------------
 
 // An empty map has nothing to lose, so empty output is the correct answer and
@@ -131,6 +175,74 @@ func TestCheck_EmptyInputIsNotLossy(t *testing.T) {
 				t.Errorf("an empty input has nothing to lose and must be OK, got reason %q", got.Reason)
 			}
 		})
+	}
+}
+
+// A struct whose only field is omitempty-and-empty encodes to zero bytes, and
+// that is correct rather than a fault. An earlier version counted struct fields
+// to decide whether the input had content, saw one field, and reported a
+// perfectly good value as lossy.
+func TestCheck_OmitEmptyFieldsAreNotLossy(t *testing.T) {
+	type onlyOmitEmpty struct {
+		A string `toon:"a,omitempty" json:"a,omitempty"`
+	}
+	if got := Check(onlyOmitEmpty{A: ""}); !got.OK {
+		t.Errorf("an omitempty field that is empty has nothing to lose, got reason %q", got.Reason)
+	}
+
+	type mixed struct {
+		A string `toon:"a,omitempty" json:"a,omitempty"`
+		B string `toon:"b" json:"b"`
+	}
+	if got := Check(mixed{A: "", B: "kept"}); !got.OK {
+		t.Errorf("a partially omitted struct must still be OK, got reason %q", got.Reason)
+	}
+}
+
+// A reference cycle exhausts the stack inside toon.Marshal, and stack
+// exhaustion is a FATAL runtime error in Go — recover() cannot catch it, so the
+// process dies with a stack dump and no diagnostic. Verified by an isolated
+// probe before this guard existed. encoding/json reports a clean error for the
+// same input.
+//
+// If this test ever crashes the suite rather than failing, the guard has
+// regressed and Check is calling the encoder on a cyclic value again.
+func TestCheck_ReferenceCycleIsRefusedNotFatal(t *testing.T) {
+	selfMap := map[string]any{"name": "root"}
+	selfMap["self"] = selfMap
+
+	got := Check(selfMap)
+	if got.OK {
+		t.Error("a cyclic value must not be reported OK; encoding it would kill the process")
+	}
+	if !strings.Contains(got.Reason, "cycle") {
+		t.Errorf("reason must name the cycle, got %q", got.Reason)
+	}
+
+	type node struct {
+		Name string `toon:"name"`
+		Next *node  `toon:"next"`
+	}
+	n := &node{Name: "a"}
+	n.Next = n
+	if Check(n).OK {
+		t.Error("a self-referencing pointer must not be reported OK")
+	}
+}
+
+// A node reachable by two different paths is a DAG, not a cycle, and must not be
+// refused. A detector that never unmarks a visited node would reject it.
+func TestCheck_SharedNodeIsNotACycle(t *testing.T) {
+	shared := map[string]any{"k": "v"}
+	in := map[string]any{"first": shared, "second": shared}
+
+	if got := Check(in); !got.OK {
+		t.Errorf("a value shared by two keys is a DAG, not a cycle, got reason %q", got.Reason)
+	}
+
+	list := []any{shared, shared, shared}
+	if got := Check(list); !got.OK {
+		t.Errorf("a node repeated in a slice is not a cycle, got reason %q", got.Reason)
 	}
 }
 
