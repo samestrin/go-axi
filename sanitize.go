@@ -1,11 +1,36 @@
 package goaxi
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 )
+
+// KeyCollisionError reports two map keys that became identical after cleaning.
+//
+// This is the one case where sanitizing cannot proceed without losing data.
+// "na\x1bme" and "name" are different keys on input and the same key after the
+// control byte is removed, so one would overwrite the other. Go randomizes map
+// iteration order, which makes the survivor vary between runs — the worst kind
+// of loss, because a test can pass today and fail tomorrow with no code change.
+//
+// Sanitize refuses rather than picking. Renaming one key would invent data the
+// caller never wrote, and dropping one is the silent loss this module exists to
+// prevent.
+type KeyCollisionError struct {
+	Cleaned any // the key both inputs produced
+	First   any // the key already present
+	Second  any // the key that would have overwritten it
+}
+
+func (e *KeyCollisionError) Error() string {
+	return fmt.Sprintf(
+		"goaxi: map keys %#v and %#v both sanitize to %#v; "+
+			"one would silently overwrite the other, so the value is refused rather than guessed",
+		e.First, e.Second, e.Cleaned)
+}
 
 // Sanitize returns a copy of v with every string cleaned of characters that
 // would either break the TOON encoder or reach stdout as a raw control byte.
@@ -33,16 +58,35 @@ import (
 // parse, and flattening a struct to map[string]any would rename every column to
 // its Go identifier. Strings inside unexported fields cannot be reached by
 // reflection and are carried through as-is.
-func Sanitize(v any) any {
+//
+// The only error returned is *KeyCollisionError. Callers whose keys are fixed
+// identifiers can rule that out and use MustSanitize.
+func Sanitize(v any) (any, error) {
 	if v == nil {
-		return nil
+		return nil, nil
 	}
-	return sanitizeValue(reflect.ValueOf(v)).Interface()
+	out, err := sanitizeValue(reflect.ValueOf(v))
+	if err != nil {
+		return nil, err
+	}
+	return out.Interface(), nil
+}
+
+// MustSanitize is Sanitize for callers whose map keys are fixed identifiers,
+// where a cleaning-induced collision is impossible by construction. It panics if
+// one occurs, because continuing would mean emitting a payload with a field
+// missing.
+func MustSanitize(v any) any {
+	out, err := Sanitize(v)
+	if err != nil {
+		panic(err)
+	}
+	return out
 }
 
 // SanitizeString cleans a single string using the same rules as Sanitize. It is
 // exported for callers that build output a field at a time rather than handing
-// over a whole value.
+// over a whole value. It cannot collide, so it returns no error.
 func SanitizeString(s string) string {
 	return cleanString(s)
 }
@@ -53,58 +97,96 @@ func SanitizeString(s string) string {
 // be shared with the caller, and a sanitizer with a side effect on its argument
 // is a trap: a caller that later writes the same value as JSON would silently
 // get the stripped version.
-func sanitizeValue(v reflect.Value) reflect.Value {
+func sanitizeValue(v reflect.Value) (reflect.Value, error) {
 	switch v.Kind() {
 	case reflect.String:
 		out := reflect.New(v.Type()).Elem()
 		out.SetString(cleanString(v.String()))
-		return out
+		return out, nil
 
 	case reflect.Interface:
 		if v.IsNil() {
-			return v
+			return v, nil
+		}
+		inner, err := sanitizeValue(v.Elem())
+		if err != nil {
+			return reflect.Value{}, err
 		}
 		out := reflect.New(v.Type()).Elem()
-		out.Set(sanitizeValue(v.Elem()))
-		return out
+		out.Set(inner)
+		return out, nil
 
 	case reflect.Pointer:
 		if v.IsNil() {
-			return v
+			return v, nil
+		}
+		inner, err := sanitizeValue(v.Elem())
+		if err != nil {
+			return reflect.Value{}, err
 		}
 		out := reflect.New(v.Type().Elem())
-		out.Elem().Set(sanitizeValue(v.Elem()))
-		return out
+		out.Elem().Set(inner)
+		return out, nil
 
 	case reflect.Slice:
 		if v.IsNil() {
-			return v
+			return v, nil
 		}
 		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
 		for i := 0; i < v.Len(); i++ {
-			out.Index(i).Set(sanitizeValue(v.Index(i)))
+			elem, err := sanitizeValue(v.Index(i))
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(elem)
 		}
-		return out
+		return out, nil
 
 	case reflect.Array:
 		out := reflect.New(v.Type()).Elem()
 		for i := 0; i < v.Len(); i++ {
-			out.Index(i).Set(sanitizeValue(v.Index(i)))
+			elem, err := sanitizeValue(v.Index(i))
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			out.Index(i).Set(elem)
 		}
-		return out
+		return out, nil
 
 	case reflect.Map:
 		if v.IsNil() {
-			return v
+			return v, nil
 		}
 		// Keys are sanitized too. A key is a field name in tabular output, so a
 		// control byte there lands in the header rather than a cell.
+		//
+		// Cleaning can make two distinct keys identical, so collisions are
+		// tracked and refused. Map keys are always comparable, so using the
+		// cleaned key in a lookup map is safe.
 		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		seen := make(map[any]any, v.Len())
 		iter := v.MapRange()
 		for iter.Next() {
-			out.SetMapIndex(sanitizeValue(iter.Key()), sanitizeValue(iter.Value()))
+			key, err := sanitizeValue(iter.Key())
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			val, err := sanitizeValue(iter.Value())
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			cleaned := key.Interface()
+			if first, dup := seen[cleaned]; dup {
+				return reflect.Value{}, &KeyCollisionError{
+					Cleaned: cleaned,
+					First:   first,
+					Second:  iter.Key().Interface(),
+				}
+			}
+			seen[cleaned] = iter.Key().Interface()
+			out.SetMapIndex(key, val)
 		}
-		return out
+		return out, nil
 
 	case reflect.Struct:
 		// Copy wholesale first so unexported fields survive, then overwrite the
@@ -117,15 +199,21 @@ func sanitizeValue(v reflect.Value) reflect.Value {
 			if t.Field(i).PkgPath != "" {
 				continue // unexported; unreachable by reflection
 			}
-			if f := out.Field(i); f.CanSet() {
-				f.Set(sanitizeValue(v.Field(i)))
+			// No CanSet guard: out came from reflect.New(...).Elem() so it is
+			// addressable, and unexported fields were skipped above, so every
+			// field reaching here is settable by construction.
+			f := out.Field(i)
+			field, err := sanitizeValue(v.Field(i))
+			if err != nil {
+				return reflect.Value{}, err
 			}
+			f.Set(field)
 		}
-		return out
+		return out, nil
 
 	default:
 		// Numbers, bools, funcs, channels: nothing to clean.
-		return v
+		return v, nil
 	}
 }
 
@@ -178,7 +266,7 @@ func unsafeRune(r rune) bool {
 	switch r {
 	case '\n', '\r', '\t':
 		return false // valid TOON escapes; toon-go handles these correctly
-	case '\u2028', '\u2029':
+	case ' ', ' ':
 		return true
 	}
 	return unicode.IsControl(r)

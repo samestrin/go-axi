@@ -15,7 +15,7 @@ import (
 // test and fail the real requirement.
 func encodes(t *testing.T, v any) string {
 	t.Helper()
-	b, err := toon.Marshal(Sanitize(v))
+	b, err := toon.Marshal(MustSanitize(v))
 	if err != nil {
 		t.Fatalf("encoding sanitized value must succeed, got: %v", err)
 	}
@@ -153,8 +153,8 @@ func TestSanitize_LeavesCleanTextAlone(t *testing.T) {
 		"-3.14",
 	}
 	for _, in := range clean {
-		if got := Sanitize(in); got != in {
-			t.Errorf("clean input must pass through unchanged: Sanitize(%q) = %q", in, got)
+		if got := MustSanitize(in); got != in {
+			t.Errorf("clean input must pass through unchanged: MustSanitize(%q) = %q", in, got)
 		}
 	}
 }
@@ -226,7 +226,7 @@ func TestSanitize_RoundTrips(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			clean := Sanitize(c.in)
+			clean := MustSanitize(c.in)
 
 			b, err := toon.Marshal(clean)
 			if err != nil {

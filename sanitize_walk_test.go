@@ -13,8 +13,8 @@ import (
 // of what it copies.
 
 func TestSanitize_Nil(t *testing.T) {
-	if got := Sanitize(nil); got != nil {
-		t.Errorf("Sanitize(nil) must be nil, got %#v", got)
+	if got := MustSanitize(nil); got != nil {
+		t.Errorf("MustSanitize(nil) must be nil, got %#v", got)
 	}
 }
 
@@ -53,9 +53,9 @@ func TestSanitize_KeepsGenuineReplacementChar(t *testing.T) {
 // output, so a control byte there lands in the header rather than in a cell.
 func TestSanitize_SanitizesMapKeys(t *testing.T) {
 	in := map[string]any{"na\x1bme": "value"}
-	got, ok := Sanitize(in).(map[string]any)
+	got, ok := MustSanitize(in).(map[string]any)
 	if !ok {
-		t.Fatalf("map must stay a map[string]any, got %T", Sanitize(in))
+		t.Fatalf("map must stay a map[string]any, got %T", MustSanitize(in))
 	}
 	if _, bad := got["na\x1bme"]; bad {
 		t.Error("the unsanitized key must not survive")
@@ -67,9 +67,9 @@ func TestSanitize_SanitizesMapKeys(t *testing.T) {
 
 func TestSanitize_Pointer(t *testing.T) {
 	s := "a\x1bb"
-	got, ok := Sanitize(&s).(*string)
+	got, ok := MustSanitize(&s).(*string)
 	if !ok {
-		t.Fatalf("pointer type must be preserved, got %T", Sanitize(&s))
+		t.Fatalf("pointer type must be preserved, got %T", MustSanitize(&s))
 	}
 	if *got != "ab" {
 		t.Errorf("pointed-to string must be cleaned, got %q", *got)
@@ -81,9 +81,9 @@ func TestSanitize_Pointer(t *testing.T) {
 
 func TestSanitize_Array(t *testing.T) {
 	in := [2]string{"a\x1bb", "ok"}
-	got, ok := Sanitize(in).([2]string)
+	got, ok := MustSanitize(in).([2]string)
 	if !ok {
-		t.Fatalf("array type must be preserved, got %T", Sanitize(in))
+		t.Fatalf("array type must be preserved, got %T", MustSanitize(in))
 	}
 	if got[0] != "ab" || got[1] != "ok" {
 		t.Errorf("array elements must be cleaned in place, got %#v", got)
@@ -98,22 +98,22 @@ func TestSanitize_NilContainersStayNil(t *testing.T) {
 	var nilMap map[string]string
 	var nilPtr *string
 
-	if got := Sanitize(nilSlice); !reflect.ValueOf(got).IsNil() {
+	if got := MustSanitize(nilSlice); !reflect.ValueOf(got).IsNil() {
 		t.Errorf("nil slice must stay nil, got %#v", got)
 	}
-	if got := Sanitize(nilMap); !reflect.ValueOf(got).IsNil() {
+	if got := MustSanitize(nilMap); !reflect.ValueOf(got).IsNil() {
 		t.Errorf("nil map must stay nil, got %#v", got)
 	}
-	if got := Sanitize(nilPtr); !reflect.ValueOf(got).IsNil() {
+	if got := MustSanitize(nilPtr); !reflect.ValueOf(got).IsNil() {
 		t.Errorf("nil pointer must stay nil, got %#v", got)
 	}
 }
 
 func TestSanitize_NilInsideInterface(t *testing.T) {
 	in := map[string]any{"absent": nil, "present": "a\x1bb"}
-	got, ok := Sanitize(in).(map[string]any)
+	got, ok := MustSanitize(in).(map[string]any)
 	if !ok {
-		t.Fatalf("map must stay a map, got %T", Sanitize(in))
+		t.Fatalf("map must stay a map, got %T", MustSanitize(in))
 	}
 	if got["absent"] != nil {
 		t.Errorf("a nil interface value must stay nil, got %#v", got["absent"])
@@ -130,9 +130,9 @@ func TestSanitize_ScalarsPassThroughUnchanged(t *testing.T) {
 		42, int64(-7), uint8(3), 3.14, float32(1.5), true, false,
 	}
 	for _, in := range cases {
-		got := Sanitize(in)
+		got := MustSanitize(in)
 		if got != in {
-			t.Errorf("scalar must pass through unchanged: Sanitize(%#v) = %#v", in, got)
+			t.Errorf("scalar must pass through unchanged: MustSanitize(%#v) = %#v", in, got)
 		}
 		if reflect.TypeOf(got) != reflect.TypeOf(in) {
 			t.Errorf("scalar type must be preserved: %T became %T", in, got)
@@ -150,9 +150,9 @@ func TestSanitize_StructWithUnexportedFields(t *testing.T) {
 		hidden   string
 	}
 	in := holder{Exported: "a\x1bb", hidden: "untouched"}
-	got, ok := Sanitize(in).(holder)
+	got, ok := MustSanitize(in).(holder)
 	if !ok {
-		t.Fatalf("struct type must be preserved, got %T", Sanitize(in))
+		t.Fatalf("struct type must be preserved, got %T", MustSanitize(in))
 	}
 	if got.Exported != "ab" {
 		t.Errorf("exported field must be cleaned, got %q", got.Exported)
@@ -162,9 +162,9 @@ func TestSanitize_StructWithUnexportedFields(t *testing.T) {
 	}
 
 	when := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
-	gotTime, ok := Sanitize(when).(time.Time)
+	gotTime, ok := MustSanitize(when).(time.Time)
 	if !ok {
-		t.Fatalf("time.Time must be preserved, got %T", Sanitize(when))
+		t.Fatalf("time.Time must be preserved, got %T", MustSanitize(when))
 	}
 	if !gotTime.Equal(when) {
 		t.Errorf("time.Time must survive intact, got %v want %v", gotTime, when)
@@ -178,7 +178,7 @@ func TestSanitize_DoesNotMutateInput(t *testing.T) {
 	in := map[string]any{
 		"rows": []any{map[string]any{"note": "bad\x1bhere"}},
 	}
-	_ = Sanitize(in)
+	_ = MustSanitize(in)
 
 	rows := in["rows"].([]any)
 	note := rows[0].(map[string]any)["note"].(string)
@@ -198,9 +198,9 @@ func TestSanitize_DeeplyNestedPointers(t *testing.T) {
 		In *inner `toon:"in"`
 	}
 	in := outer{In: &inner{Note: "a\x1bb"}}
-	got, ok := Sanitize(in).(outer)
+	got, ok := MustSanitize(in).(outer)
 	if !ok {
-		t.Fatalf("struct type must be preserved, got %T", Sanitize(in))
+		t.Fatalf("struct type must be preserved, got %T", MustSanitize(in))
 	}
 	if got.In == nil {
 		t.Fatal("nested pointer must not be nilled out")
