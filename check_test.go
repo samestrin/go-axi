@@ -1,6 +1,7 @@
 package goaxi
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -227,6 +228,54 @@ func TestCheck_ReferenceCycleIsRefusedNotFatal(t *testing.T) {
 	n.Next = n
 	if Check(n).OK {
 		t.Error("a self-referencing pointer must not be reported OK")
+	}
+}
+
+// A cycle can close entirely through map KEYS. atcr's review caught this as
+// CRITICAL (greta) and HIGH (kai) and it was reproduced before the fix: hasCycle
+// walked only map values, while sanitizeValue recurses into keys with no
+// seen-set, so Sanitize exhausted the stack and killed the process — exit status
+// 2, recover() never firing.
+//
+// It was dismissed once on the reasoning that toon-go rejects pointer-keyed maps.
+// That reasoning covered Check only. Sanitize is called directly by consumers
+// and never reaches toon.Marshal, so the rejection was irrelevant.
+//
+// If this test ever crashes the suite instead of failing, the guard has
+// regressed and the key traversal is gone again.
+func TestCheck_CycleThroughAMapKeyIsRefused(t *testing.T) {
+	type node struct {
+		Name string         `toon:"name"`
+		M    map[string]any `toon:"m"`
+	}
+	n := &node{Name: "root"}
+	cyc := map[*node]string{n: "v"}
+	n.M = map[string]any{"back": cyc}
+
+	if got := Check(cyc); got.OK {
+		t.Error("a cycle reachable only through a map key must not be reported OK")
+	}
+
+	out, err := Sanitize(cyc)
+	if err == nil {
+		t.Fatalf("Sanitize must refuse a key-reachable cycle rather than crash, got %#v", out)
+	}
+	var cycleErr *CycleError
+	if !errors.As(err, &cycleErr) {
+		t.Errorf("error must be a *CycleError, got %T: %v", err, err)
+	}
+}
+
+// A pointer key that is NOT part of a cycle must still pass. A guard that
+// rejected every pointer-keyed map would be useless.
+func TestCheck_AcyclicPointerKeyIsAccepted(t *testing.T) {
+	type leaf struct {
+		Name string `toon:"name"`
+	}
+	k := &leaf{Name: "ok"}
+
+	if _, err := Sanitize(map[*leaf]string{k: "v"}); err != nil {
+		t.Errorf("an acyclic pointer key must be accepted, got %v", err)
 	}
 }
 
