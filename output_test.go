@@ -2,6 +2,9 @@ package goaxi
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -100,8 +103,15 @@ func TestWriteHelp_AppendsToABodyWithoutBreakingIt(t *testing.T) {
 		t.Fatalf("body+help must decode as one payload: %v (payload %q)", err, b.String())
 	}
 	m := got.(map[string]any)
-	if m["count"] != 2 {
-		t.Errorf("the body must survive the appended help, got count=%#v", m["count"])
+	// Compared by value, not by Go type. Which numeric type the decoder returns
+	// is its own business, and pinning it here would make this test fail on a
+	// codec change that broke nothing.
+	count, ok := m["count"]
+	if !ok {
+		t.Fatalf("the body must survive the appended help, got %#v", m)
+	}
+	if fmt.Sprint(count) != "2" {
+		t.Errorf("body value corrupted by the appended help: count=%#v (%T)", count, count)
 	}
 	if _, ok := m["help"]; !ok {
 		t.Errorf("the help block must be present alongside the body, got %#v", m)
@@ -200,6 +210,64 @@ func TestEncode_SanitizesAndTerminatesWithOneNewline(t *testing.T) {
 	}
 	if strings.HasSuffix(out, "\n\n") {
 		t.Errorf("output must end with exactly one newline, got %q", out)
+	}
+}
+
+// --- write errors ----------------------------------------------------------
+
+// failingWriter fails every write.
+type failingWriter struct{ err error }
+
+func (f failingWriter) Write([]byte) (int, error) { return 0, f.err }
+
+// nthFailWriter succeeds until the nth write, then fails. It exists to reach the
+// trailing-newline write specifically, which is a separate call from the body.
+type nthFailWriter struct {
+	failOn int
+	seen   int
+	err    error
+}
+
+func (w *nthFailWriter) Write(p []byte) (int, error) {
+	w.seen++
+	if w.seen >= w.failOn {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+// A write error must propagate rather than be swallowed. This is not a
+// hypothetical: an agent piping output into `head` closes the pipe, and a
+// swallowed EPIPE means the caller believes it emitted a complete payload when
+// the consumer received a truncated one.
+func TestWriteErrorsPropagate(t *testing.T) {
+	boom := errors.New("broken pipe")
+
+	cases := []struct {
+		name string
+		call func(io.Writer) error
+	}{
+		{"Encode", func(w io.Writer) error { return Encode(w, map[string]any{"f": "x"}) }},
+		{"WriteHelp", func(w io.Writer) error { return WriteHelp(w, []string{"Run x"}) }},
+		{"EncodeOrJSON lossless", func(w io.Writer) error {
+			return EncodeOrJSON(w, map[string]any{"f": "x"})
+		}},
+		{"EncodeOrJSON fallback", func(w io.Writer) error {
+			return EncodeOrJSON(w, map[string]any{"m": textMarshaler{v: "x"}})
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name+" body write", func(t *testing.T) {
+			if err := c.call(failingWriter{err: boom}); !errors.Is(err, boom) {
+				t.Errorf("a failed body write must propagate, got %v", err)
+			}
+		})
+		t.Run(c.name+" newline write", func(t *testing.T) {
+			w := &nthFailWriter{failOn: 2, err: boom}
+			if err := c.call(w); !errors.Is(err, boom) {
+				t.Errorf("a failed trailing-newline write must propagate, got %v", err)
+			}
+		})
 	}
 }
 
