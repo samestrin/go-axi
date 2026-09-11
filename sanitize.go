@@ -32,6 +32,29 @@ func (e *KeyCollisionError) Error() string {
 		e.First, e.Second, e.Cleaned)
 }
 
+// CycleError reports a value that refers to itself, directly or through other
+// nodes.
+//
+// TOON has no way to express a back-reference, so there is no correct encoding
+// to fall back to. The walk is refused before it is entered rather than bounded
+// part way in: sanitizeValue recurses through pointers with no seen-set, and the
+// resulting stack overflow is a fatal runtime error, not a panic. No recover()
+// catches it, so the process dies with a goroutine dump instead of returning to
+// the caller — the exact class of failure this module exists to convert into an
+// error.
+//
+// Check already refuses a cycle for this reason. Sanitize now agrees, so the
+// guarantee does not depend on which entry point a caller happened to reach for.
+type CycleError struct {
+	Type string // the type the cycle was detected in
+}
+
+func (e *CycleError) Error() string {
+	return fmt.Sprintf(
+		"goaxi: value of type %s contains a reference cycle; TOON cannot represent one, "+
+			"and walking it would exhaust the stack and kill the process", e.Type)
+}
+
 // Sanitize returns a copy of v with every string cleaned of characters that
 // would either break the TOON encoder or reach stdout as a raw control byte.
 //
@@ -59,23 +82,36 @@ func (e *KeyCollisionError) Error() string {
 // its Go identifier. Strings inside unexported fields cannot be reached by
 // reflection and are carried through as-is.
 //
-// The only error returned is *KeyCollisionError. Callers whose keys are fixed
-// identifiers can rule that out and use MustSanitize.
+// Two errors are returned: *CycleError for a self-referential value, and
+// *KeyCollisionError for two map keys that clean to the same string. A caller
+// whose keys are fixed identifiers and whose shapes are acyclic can rule both
+// out and use MustSanitize.
 func Sanitize(v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	out, err := sanitizeValue(reflect.ValueOf(v))
+	rv := reflect.ValueOf(v)
+	// Refuse before walking, not during. sanitizeValue follows pointers with no
+	// seen-set, so a cycle never reaches the error return — it exhausts the
+	// stack and kills the process. This reuses the detector Check uses, so the
+	// two entry points cannot disagree about what counts as a cycle.
+	if hasCycle(rv, map[uintptr]bool{}, 0) {
+		return nil, &CycleError{Type: typeName(reflect.TypeOf(v))}
+	}
+	out, err := sanitizeValue(rv)
 	if err != nil {
 		return nil, err
 	}
 	return out.Interface(), nil
 }
 
-// MustSanitize is Sanitize for callers whose map keys are fixed identifiers,
-// where a cleaning-induced collision is impossible by construction. It panics if
-// one occurs, because continuing would mean emitting a payload with a field
-// missing.
+// MustSanitize is Sanitize for callers whose map keys are fixed identifiers and
+// whose shapes are acyclic, where both failures are impossible by construction.
+// It panics if one occurs, because continuing would mean emitting a payload with
+// a field missing.
+//
+// A panic is the lesser evil for a cycle specifically: it unwinds and can be
+// recovered, whereas the stack overflow it replaces is fatal and cannot.
 func MustSanitize(v any) any {
 	out, err := Sanitize(v)
 	if err != nil {
