@@ -1,0 +1,420 @@
+package goaxi
+
+import (
+	"encoding"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"regexp"
+	"strings"
+	"time"
+
+	toon "github.com/toon-format/toon-go"
+)
+
+// Tier describes the payload shape TOON encoding actually produces.
+//
+// The tiers are defined by measured behavior, not by what a format "should"
+// handle. toon-go encodes ragged rows, list-valued fields and nested objects
+// losslessly using a list form, so "can it be encoded" separates nothing useful.
+// What differs is the shape emitted, and whether anything is lost.
+type Tier int
+
+const (
+	// TierTabular is TOON's best case: uniform rows that encode as a tabular
+	// array with a declared field list. This is where the token savings come
+	// from.
+	TierTabular Tier = iota
+
+	// TierNested is lossless but not tabular. Ragged rows, list-valued fields
+	// and nested objects land here. The payload is correct; it just does not
+	// get the columnar win.
+	TierNested
+
+	// TierLossy means encoding silently discards data. Nothing in this tier
+	// should be emitted as TOON.
+	TierLossy
+)
+
+func (t Tier) String() string {
+	switch t {
+	case TierTabular:
+		return "tabular"
+	case TierNested:
+		return "nested"
+	case TierLossy:
+		return "lossy"
+	default:
+		return fmt.Sprintf("Tier(%d)", int(t))
+	}
+}
+
+// Verdict is the result of inspecting a value before encoding it.
+//
+// OK and Efficient are deliberately separate. Correctness and cost are
+// orthogonal: a payload can be perfectly lossless and still cost more as TOON
+// than as JSON, which is a reason to choose JSON for that command but never a
+// reason to call the value broken.
+type Verdict struct {
+	// OK reports that encoding this value as TOON preserves its data.
+	OK bool
+
+	// Tier is the shape TOON encoding produces.
+	Tier Tier
+
+	// Efficient reports that the TOON payload is no larger than the JSON one.
+	Efficient bool
+
+	// Reason explains a false OK or Efficient in terms an operator can act on.
+	Reason string
+}
+
+// textMarshalerType is the interface toon-go silently ignores.
+var textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+
+// timeType is special-cased by toon-go and must NOT be treated as lossy even
+// though time.Time implements TextMarshaler. Verified by probe: a time.Time
+// encodes as `at: "2026-09-11T12:00:00Z"`, not as an empty value. Without this
+// exclusion Check rejects every payload carrying a timestamp.
+var timeType = reflect.TypeOf(time.Time{})
+
+// maxWalkDepth bounds the value walk. A value can contain a reference cycle,
+// which the type walk terminates via its seen set but the value walk cannot.
+const maxWalkDepth = 100
+
+// isLossyType reports whether toon-go drops values of this type.
+//
+// Only t's own method set is consulted. Checking reflect.PointerTo(t) as well
+// would over-flag: a type whose pointer implements TextMarshaler but which is
+// stored by value never has the method called, so nothing is lost.
+func isLossyType(t reflect.Type) bool {
+	if t == nil || t == timeType {
+		return false
+	}
+	return t.Implements(textMarshalerType)
+}
+
+func lossyReason(t reflect.Type) string {
+	return fmt.Sprintf("%s implements encoding.TextMarshaler, which toon-go ignores: "+
+		"the value is silently dropped while its key is still emitted", typeName(t))
+}
+
+// tabularHeader matches a TOON tabular array header, e.g. `rows[2]{id,name}:`.
+// The braced field list is the discriminator: a non-uniform array emits
+// `rows[2]:` with no field list and falls back to indented list items.
+var tabularHeader = regexp.MustCompile(`(?m)^\s*[^\[\]{}:]*\[\d+[^\]]*\]\{[^}]*\}:`)
+
+// Check reports whether v can be encoded as TOON without losing data, what
+// shape the payload takes, and whether TOON actually costs less than JSON.
+//
+// It exists because toon-go fails in ways neither an error check nor a length
+// check catches, all confirmed against the pinned version:
+//
+//   - A defined string type (type Kind string) returns a real error. Loud.
+//   - A TextMarshaler at top level returns a nil error with EMPTY output, so
+//     the command prints nothing and exits zero.
+//   - A TextMarshaler nested in a struct or map encodes to "m:" — key present,
+//     value gone, nil error, non-zero length. A guard testing only err and
+//     len(b) passes this while the data is lost.
+//
+// Loss is found by reflection rather than by round-tripping and comparing
+// against the JSON projection. That comparison looks correct and is not:
+// toon-go does not fall back to the json tag, so a field tagged only
+// `json:"x"` encodes under its Go field name and the two projections disagree
+// for reasons that have nothing to do with data loss.
+func Check(v any) Verdict {
+	// Two walks, because neither alone is sufficient. The type walk catches a
+	// lossy type declared in an empty or nil container, which holds no values to
+	// inspect. The value walk catches a lossy type reaching an `any` field,
+	// whose static type says nothing about what it holds.
+	if reason := lossyInType(reflect.TypeOf(v), map[reflect.Type]bool{}); reason != "" {
+		return Verdict{Tier: TierLossy, Reason: reason}
+	}
+	if reason := lossyInValue(reflect.ValueOf(v), 0); reason != "" {
+		return Verdict{Tier: TierLossy, Reason: reason}
+	}
+
+	// Cycles must be caught BEFORE toon.Marshal. A reference cycle exhausts the
+	// stack inside the encoder, and stack exhaustion is a fatal runtime error in
+	// Go — recover() cannot catch it, so the whole process dies with a stack
+	// dump and no diagnostic. encoding/json reports a clean error for the same
+	// input; toon-go does not. Verified by an isolated probe.
+	if hasCycle(reflect.ValueOf(v), map[uintptr]bool{}, 0) {
+		return Verdict{
+			Tier: TierLossy,
+			Reason: "value contains a reference cycle; TOON cannot represent one, " +
+				"and encoding it would exhaust the stack and kill the process",
+		}
+	}
+
+	// Everything below measures the SANITIZED value, because that is what Encode
+	// actually emits. Judging the raw value instead made Check contradict Encode:
+	// a string carrying an ANSI escape makes toon.Marshal fail, so Check called a
+	// perfectly good value lossy — and reported "declare it as a type alias",
+	// advice with nothing to do with the real cause. EncodeOrJSON then routed on
+	// that verdict and emitted a JSON envelope for a value TOON handles fine.
+	//
+	// Sanitizing must come after the cycle guard above. Sanitize walks the value
+	// without cycle protection of its own, so a cyclic input would exhaust the
+	// stack here rather than be refused.
+	clean, sErr := Sanitize(v)
+	if sErr != nil {
+		return Verdict{Tier: TierLossy, Reason: sErr.Error()}
+	}
+
+	b, err := toon.Marshal(clean)
+	if err != nil {
+		return Verdict{
+			Tier: TierLossy,
+			Reason: fmt.Sprintf("%v; toon-go supports plain builtin types only, "+
+				"so declare it as a type alias (=) rather than a defined type", err),
+		}
+	}
+
+	// Empty output is the correct answer for an empty input, and a fault for
+	// anything else. Reporting every zero-length payload as broken would cry
+	// wolf on legitimately empty results, which AXI asks to be stated plainly.
+	if len(b) == 0 && !encodesToNothing(clean) {
+		return Verdict{
+			Tier:   TierLossy,
+			Reason: "encoder produced empty output for a non-empty value",
+		}
+	}
+
+	verdict := Verdict{OK: true, Tier: TierNested}
+	if tabularHeader.Match(b) {
+		verdict.Tier = TierTabular
+	}
+
+	jb, jerr := json.Marshal(clean)
+	if jerr == nil {
+		verdict.Efficient = len(b) <= len(jb)
+		if !verdict.Efficient {
+			verdict.Reason = fmt.Sprintf(
+				"TOON is larger than JSON for this shape (%d vs %d bytes); prefer JSON for this command",
+				len(b), len(jb))
+		}
+	}
+	return verdict
+}
+
+// CanEncode reports whether v survives TOON encoding without losing data. It is
+// the boolean form of Check for callers that do not need the detail.
+func CanEncode(v any) bool { return Check(v).OK }
+
+// lossyInType walks the declared type tree, returning a reason or "".
+//
+// This catches a lossy type declared inside an empty or nil container, which
+// holds no values to inspect. Interface types are skipped deliberately: a static
+// `any` says nothing about what it will hold, so only lossyInValue can judge it.
+//
+// The seen set makes recursive types terminate. Memoizing by type is sound here
+// precisely because this walk never consults a value.
+func lossyInType(t reflect.Type, seen map[reflect.Type]bool) string {
+	if t == nil || seen[t] {
+		return ""
+	}
+	if isLossyType(t) {
+		return lossyReason(t)
+	}
+	seen[t] = true
+
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		return lossyInType(t.Elem(), seen)
+
+	case reflect.Map:
+		if reason := lossyInType(t.Key(), seen); reason != "" {
+			return reason
+		}
+		return lossyInType(t.Elem(), seen)
+
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			if t.Field(i).PkgPath != "" {
+				continue // unexported; never encoded
+			}
+			if reason := lossyInType(t.Field(i).Type, seen); reason != "" {
+				return reason
+			}
+		}
+		return ""
+
+	default:
+		return ""
+	}
+}
+
+// lossyInValue walks actual values, following interfaces to their dynamic type.
+//
+// It deliberately does NOT memoize by type. An earlier version shared one seen
+// set between the type and value walks, and that silently defeated the whole
+// check: for a []any the element's static type is `interface{}`, which the type
+// walk had already marked, so every dynamic element was skipped and a
+// TextMarshaler inside a slice or map went undetected.
+//
+// Cycles are bounded by depth instead, since a value cycle cannot be detected by
+// type identity.
+func lossyInValue(v reflect.Value, depth int) string {
+	if !v.IsValid() || depth > maxWalkDepth {
+		return ""
+	}
+	if isLossyType(v.Type()) {
+		return lossyReason(v.Type())
+	}
+
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if v.IsNil() {
+			return ""
+		}
+		return lossyInValue(v.Elem(), depth+1)
+
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			if t.Field(i).PkgPath != "" {
+				continue
+			}
+			if reason := lossyInValue(v.Field(i), depth+1); reason != "" {
+				return reason
+			}
+		}
+		return ""
+
+	case reflect.Map:
+		if v.IsNil() {
+			return ""
+		}
+		iter := v.MapRange()
+		for iter.Next() {
+			if reason := lossyInValue(iter.Key(), depth+1); reason != "" {
+				return reason
+			}
+			if reason := lossyInValue(iter.Value(), depth+1); reason != "" {
+				return reason
+			}
+		}
+		return ""
+
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			return ""
+		}
+		for i := 0; i < v.Len(); i++ {
+			if reason := lossyInValue(v.Index(i), depth+1); reason != "" {
+				return reason
+			}
+		}
+		return ""
+
+	default:
+		return ""
+	}
+}
+
+// hasCycle reports whether v refers to itself, directly or through other nodes.
+//
+// Only maps and pointers are tracked by identity, which is where a Go value can
+// actually close a loop; a slice cannot contain itself without one of those. The
+// seen entry is removed on the way back out, so a node legitimately reachable by
+// two different paths — a DAG, not a cycle — is not mistaken for one.
+func hasCycle(v reflect.Value, seen map[uintptr]bool, depth int) bool {
+	if !v.IsValid() || depth > maxWalkDepth {
+		return false
+	}
+
+	switch v.Kind() {
+	case reflect.Map, reflect.Pointer:
+		if v.IsNil() {
+			return false
+		}
+		p := v.Pointer()
+		if seen[p] {
+			return true
+		}
+		seen[p] = true
+		defer delete(seen, p)
+	}
+
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			return false
+		}
+		return hasCycle(v.Elem(), seen, depth+1)
+
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			if hasCycle(iter.Value(), seen, depth+1) {
+				return true
+			}
+		}
+		return false
+
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			return false
+		}
+		for i := 0; i < v.Len(); i++ {
+			if hasCycle(v.Index(i), seen, depth+1) {
+				return true
+			}
+		}
+		return false
+
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			if t.Field(i).PkgPath != "" {
+				continue
+			}
+			if hasCycle(v.Field(i), seen, depth+1) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
+}
+
+// encodesToNothing reports whether v genuinely has nothing to emit, so empty
+// output is the correct answer rather than a fault.
+//
+// The question is asked of the JSON projection rather than by counting struct
+// fields. Counting was wrong: a struct whose only field is `omitempty` and empty
+// has one field and still encodes to zero bytes, so Check called a perfectly
+// good value lossy.
+//
+// Deferring to encoding/json is safe here even though toon-go does not share its
+// tag names, because emptiness does not depend on what the keys are called, and
+// both encoders honour omitempty identically (verified by probe). A
+// TextMarshaler would fool this test, but it is already rejected by the two
+// lossy walks before this point is reached.
+func encodesToNothing(v any) bool {
+	if v == nil {
+		return true
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return false // cannot tell; treat as having content
+	}
+	switch strings.TrimSpace(string(b)) {
+	case "{}", "[]", "null", `""`:
+		return true
+	default:
+		return false
+	}
+}
+
+// typeName renders a type for an error message, falling back to its string form
+// for anonymous types.
+func typeName(t reflect.Type) string {
+	if n := t.Name(); n != "" {
+		return n
+	}
+	return strings.TrimSpace(t.String())
+}
