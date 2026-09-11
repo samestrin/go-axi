@@ -1,0 +1,13 @@
+# Build output
+/build/
+*.out
+*.test
+
+# atcr workspace runtime outputs (diff cache + reviewer outputs, never committed)
+.atcr/
+
+# Planning artifacts
+.planning/
+
+# Editor/OS noise
+.DS_Store
