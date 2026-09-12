@@ -166,6 +166,63 @@ func TestCheck_NodeMemoizationNeitherHidesNorInventsLoss(t *testing.T) {
 	})
 }
 
+// The seen set made lossy detection depend on two edges it never depended on
+// before, and this repo's history says both are exactly where identity tracking
+// breaks: a pointer used as a map KEY, and two slices sharing one backing array.
+// The cycle guard has a regression test for each; lossy detection had neither.
+//
+// Promoted here after an adversarial pass failed to break them, so the cases
+// that were probed once do not have to be probed again by hand.
+func TestCheck_MemoizationDoesNotHideLossOnTheHardEdges(t *testing.T) {
+	type keyed struct {
+		M textMarshaler `toon:"m"`
+	}
+
+	// A pointer key is the one construction that reaches the key branch. A map
+	// key must be comparable, which rules out using a map or slice directly, and
+	// a pointer is comparable regardless of what it points at. Repeated because
+	// map iteration order is randomized, so a bug could hide in whichever
+	// position happens to be visited second and mark the node seen first.
+	t.Run("behind a pointer map key", func(t *testing.T) {
+		key := &keyed{M: textMarshaler{v: "SECRET"}}
+		nested := map[string]any{
+			"asValue": key,
+			"asKey":   map[*keyed]int{key: 1},
+		}
+		for i := 0; i < 100; i++ {
+			if got := Check(nested); got.OK {
+				t.Fatalf("loss must be found whether the node arrives as key or value, got OK at tier %v", got.Tier)
+			}
+		}
+	})
+
+	// outer[0:1] shares its parent's data pointer. Keyed on the address alone the
+	// sub-slice would mask the parent, and the lossy element at index 1 — outside
+	// the sub-slice — would never be walked. The length is what keeps them apart.
+	t.Run("outside a sub-slice sharing a backing array", func(t *testing.T) {
+		outer := []any{"ok", keyed{M: textMarshaler{v: "SECRET"}}}
+		for i := 0; i < 100; i++ {
+			if got := Check(map[string]any{"sub": outer[0:1], "outer": outer}); got.OK {
+				t.Fatalf("loss at an index outside the sub-slice must still be found, got OK at tier %v", got.Tier)
+			}
+		}
+	})
+
+	// Zero-length slices are deliberately untracked, because zero-length
+	// allocations share one address (runtime.zerobase) and tracking them would
+	// collide unrelated slices. That choice must not mask a sibling.
+	t.Run("beside untracked empty slices", func(t *testing.T) {
+		got := Check(map[string]any{
+			"a": []any{},
+			"b": []any{},
+			"c": []any{keyed{M: textMarshaler{v: "SECRET"}}},
+		})
+		if got.OK {
+			t.Error("an empty-slice sibling must not mask a loss")
+		}
+	})
+}
+
 // A defined string type fails loudly rather than silently, but it still cannot
 // be encoded, so Check must report it as unusable with a reason that names the
 // documented workaround.
