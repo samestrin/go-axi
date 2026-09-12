@@ -63,7 +63,14 @@ type Verdict struct {
 	Tier Tier
 
 	// Efficient reports that the TOON payload is no larger than the JSON one.
+	// Only meaningful when SizeCompared is true.
 	Efficient bool
+
+	// SizeCompared reports whether Efficient was actually measured. The
+	// comparison needs a second marshal, so a path that writes the payload and
+	// never reads the cost signal skips it. Without this flag a skipped
+	// comparison is indistinguishable from a measured "TOON is larger".
+	SizeCompared bool
 
 	// Reason explains a false OK or Efficient in terms an operator can act on.
 	Reason string
@@ -147,15 +154,30 @@ func Check(v any) Verdict {
 // give the same answer either way, but the measurements must be taken on what
 // will actually be emitted.
 func CheckSanitized(v any, clean any) Verdict {
+	verdict, _ := verdictFor(v, clean, true)
+	return verdict
+}
+
+// verdictFor is the single pass behind CheckSanitized and EncodeChecked.
+//
+// It returns the verdict AND the TOON bytes the verdict was derived from, so a
+// caller that intends to write those bytes does not marshal the same value a
+// second time. Check followed by Encode used to do exactly that — two sanitize
+// walks and two marshals for one guard, 2.27x the allocations of encoding alone
+// on a 2000-row payload (222,204 against 98,073).
+//
+// sizeCompare gates the TOON-versus-JSON measurement, which costs another
+// marshal and is only read by a caller asking for the cost signal.
+func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	// Two walks, because neither alone is sufficient. The type walk catches a
 	// lossy type declared in an empty or nil container, which holds no values to
 	// inspect. The value walk catches a lossy type reaching an `any` field,
 	// whose static type says nothing about what it holds.
 	if reason := lossyInType(reflect.TypeOf(v), map[reflect.Type]bool{}); reason != "" {
-		return Verdict{Tier: TierLossy, Reason: reason}
+		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
 	if reason := lossyInValue(reflect.ValueOf(v), 0); reason != "" {
-		return Verdict{Tier: TierLossy, Reason: reason}
+		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
 
 	// Measurements are taken on the SANITIZED value, because that is what Encode
@@ -176,7 +198,7 @@ func CheckSanitized(v any, clean any) Verdict {
 			Reason: fmt.Sprintf("%v; toon-go supports plain builtin types only — "+
 				"where the type is a defined type over a builtin, declare it as a "+
 				"type alias (=) instead", err),
-		}
+		}, nil
 	}
 
 	// Empty output is the correct answer for an empty input, and a fault for
@@ -186,7 +208,7 @@ func CheckSanitized(v any, clean any) Verdict {
 		return Verdict{
 			Tier:   TierLossy,
 			Reason: "encoder produced empty output for a non-empty value",
-		}
+		}, nil
 	}
 
 	verdict := Verdict{OK: true, Tier: TierNested}
@@ -194,16 +216,19 @@ func CheckSanitized(v any, clean any) Verdict {
 		verdict.Tier = TierTabular
 	}
 
-	jb, jerr := json.Marshal(clean)
-	if jerr == nil {
-		verdict.Efficient = len(b) <= len(jb)
-		if !verdict.Efficient {
-			verdict.Reason = fmt.Sprintf(
-				"TOON is larger than JSON for this shape (%d vs %d bytes); prefer JSON for this command",
-				len(b), len(jb))
+	if sizeCompare {
+		jb, jerr := json.Marshal(clean)
+		if jerr == nil {
+			verdict.SizeCompared = true
+			verdict.Efficient = len(b) <= len(jb)
+			if !verdict.Efficient {
+				verdict.Reason = fmt.Sprintf(
+					"TOON is larger than JSON for this shape (%d vs %d bytes); prefer JSON for this command",
+					len(b), len(jb))
+			}
 		}
 	}
-	return verdict
+	return verdict, b
 }
 
 // CanEncode reports whether v survives TOON encoding without losing data. It is

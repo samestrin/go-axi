@@ -14,7 +14,8 @@
 //     encoding.TextMarshaler, and a violating type does not error — it emits
 //     EMPTY output. A command silently prints nothing. Check turns that into a
 //     detectable condition, and additionally reports when TOON is larger than
-//     JSON for a given shape.
+//     JSON for a given shape. EncodeChecked applies that guard on the way out
+//     in a single pass, for callers that are about to print.
 //
 //   - Exit codes: one canonical set, as exported constants rather than a rule
 //     written in a style guide.
