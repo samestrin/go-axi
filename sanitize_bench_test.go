@@ -107,23 +107,50 @@ func BenchmarkSanitizeString(b *testing.B) {
 // copy is entirely gone; 15.0 leaves headroom above the floor without letting a
 // reinstated copy pass, which would show up at 31.0.
 func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
+	clean := allocationsPerRow(t, false)
+	dirty := allocationsPerRow(t, true)
+
+	// Compared against the DIRTY path measured in the same run, not against a
+	// fixed number. Both figures are dominated by reflect map-iteration boxing,
+	// which is a runtime implementation detail: a toolchain that changes how
+	// MapRange allocates moves both together and the ratio holds, where an
+	// absolute ceiling would fail the suite with no code change at all.
+	//
+	// Measured 12.0 clean against 22.0 dirty, a ratio of 0.55. Reinstating the
+	// unconditional copy puts clean at 31.0 against roughly 32.0 dirty — a ratio
+	// near 0.97, because then both paths rebuild everything and the clean case
+	// has nothing left to save. 0.75 separates those cleanly.
+	const maxShare = 0.75
+
+	if share := clean / dirty; share > maxShare {
+		t.Errorf("a clean payload costs %.2f of what a dirty one costs (%.1f vs %.1f allocations "+
+			"per row), want at most %.2f. A clean value is being rebuilt node by node into a "+
+			"copy identical to the input.", share, clean, dirty, maxShare)
+	}
+}
+
+// allocationsPerRow measures the MARGINAL allocation cost of one row, so the
+// figure is independent of the fixed cost of a call. It names no internal
+// function, so merging or renaming the walks cannot break its callers.
+func allocationsPerRow(t *testing.T, dirty bool) float64 {
+	t.Helper()
+
 	const (
-		small     = 20
-		large     = 500
-		maxPerRow = 15.0
+		small = 20
+		large = 500
 	)
 
-	allocsFor := func(n int) float64 {
-		v := benchRows(n, false)
+	measure := func(n int) float64 {
+		v := benchRows(n, dirty)
 
-		// Guard the fixture. If it ever stops being clean this measures the
-		// dirty path, where copying is unavoidable and the number is meaningless.
-		clean, err := Sanitize(v)
+		// Guard the fixture in whichever direction this caller needs. A clean
+		// measurement taken on a dirty payload, or the reverse, is meaningless.
+		got, err := Sanitize(v)
 		if err != nil {
 			t.Fatalf("fixture must sanitize without error: %v", err)
 		}
-		if !reflect.DeepEqual(clean, v) {
-			t.Fatal("fixture must need no cleaning, or this measures the copy of a dirty value")
+		if changed := !reflect.DeepEqual(got, v); changed != dirty {
+			t.Fatalf("fixture dirty=%v but sanitizing changed it=%v", dirty, changed)
 		}
 
 		return testing.AllocsPerRun(50, func() {
@@ -133,12 +160,7 @@ func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 		})
 	}
 
-	perRow := (allocsFor(large) - allocsFor(small)) / float64(large-small)
-	if perRow > maxPerRow {
-		t.Errorf("Sanitize allocates %.1f times per row for a payload with nothing to clean, "+
-			"want at most %.1f. A clean value is being rebuilt node by node into a copy "+
-			"identical to the input.", perRow, maxPerRow)
-	}
+	return (measure(large) - measure(small)) / float64(large-small)
 }
 
 // Making the clean path cheap must not be paid for by the dirty path.
@@ -151,44 +173,27 @@ func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 // dirty. needsCleaning answers the same question without building anything and
 // exits at the first string that needs work.
 //
-// Measured: 32.0 per row before any of this, 54.0 with the discarding version,
-// 27.0 now. The ceiling of 35.0 would have failed the discarding version while
-// still admitting the original unconditional copy, because what this guards is
-// the double build, not the copy itself — the clean-path test above is what
-// requires the copy to be skipped.
+// Measured 32.0 per row before any of this, 54.0 with the discarding version,
+// 22.0 now. Expressed against the CLEAN path from the same run rather than as a
+// fixed ceiling, for the reason given on the clean test: both figures move
+// together under a toolchain change, so the ratio survives one and an absolute
+// number does not.
+//
+// Dirty is 22.0 against 12.0 clean, a ratio of 1.8. The discarding version was
+// 54.0 against 12.0, a ratio of 4.5, so 3.0 separates them. This guards the
+// DOUBLE BUILD specifically, not the copy — the clean test above is what
+// requires the copy to be skipped at all.
 func TestSanitize_DirtyPayloadDoesNotPayTwice(t *testing.T) {
-	const (
-		small     = 20
-		large     = 500
-		maxPerRow = 35.0
-	)
+	clean := allocationsPerRow(t, false)
+	dirty := allocationsPerRow(t, true)
 
-	allocsFor := func(n int) float64 {
-		v := benchRows(n, true)
+	const maxRatio = 3.0
 
-		// Guard the fixture from the opposite direction to the clean test: this
-		// one is meaningless unless sanitizing really does change the value.
-		cleaned, err := Sanitize(v)
-		if err != nil {
-			t.Fatalf("fixture must sanitize without error: %v", err)
-		}
-		if reflect.DeepEqual(cleaned, v) {
-			t.Fatal("fixture must need cleaning, or this measures the clean path")
-		}
-
-		return testing.AllocsPerRun(50, func() {
-			if _, err := Sanitize(v); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-
-	perRow := (allocsFor(large) - allocsFor(small)) / float64(large-small)
-	if perRow > maxPerRow {
-		t.Errorf("Sanitize allocates %.1f times per row for a payload that needs cleaning, "+
-			"want at most %.1f. A cost this high means the rebuild is being allocated "+
+	if ratio := dirty / clean; ratio > maxRatio {
+		t.Errorf("a payload needing cleaning costs %.1fx a clean one (%.1f vs %.1f allocations "+
+			"per row), want at most %.1fx. A cost this high means the rebuild is allocated "+
 			"twice — once to decide whether anything changed, once to build the result.",
-			perRow, maxPerRow)
+			ratio, dirty, clean, maxRatio)
 	}
 }
 

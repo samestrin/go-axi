@@ -319,23 +319,55 @@ func TestSanitize_PredicateAgreesWithTheWalk(t *testing.T) {
 	}
 }
 
-// Depth must not defeat cleaning. The gate runs once per container level, so a
-// deep value is scanned repeatedly — that cost is documented on needsCleaning
-// and accepted. What must never happen is the value coming back uncleaned, or
-// the walk failing to terminate.
+// Depth must not defeat cleaning, and must not cost more than linearly.
 //
 // 200 levels is far past anything a TOON payload produces (rows are two to four
-// levels deep) and is chosen to sit well beyond the depth cap that used to
-// bound the lossy walk, so a reinstated cap of any similar size would fail here
-// rather than silently pass the dirty string through.
+// levels deep) and sits well beyond the depth cap that used to bound the lossy
+// walk, so a reinstated cap of any similar size fails here rather than silently
+// passing the dirty string through.
+//
+// The scaling half of this test guards a regression that shipped once. Gating
+// needsCleaning per container, to pass clean subtrees through untouched, looks
+// like a clear win and is the opposite: each gate re-scans its entire subtree,
+// so a payload dirty only at the deepest leaf — every gate forced to scan all
+// the way down — cost O(n × depth). Measured at 3.97 SECONDS for a value nested
+// 10,000 deep, which is exactly the depth encoding/json accepts before rejecting
+// at 10,001, so untrusted input reaches it. One dirty byte also ran 23x slower
+// than a payload dirty at every level, because dirt near the top lets each gate
+// exit early. Gating once at the root instead is 14ms for the same input.
+//
+// Doubling the depth must therefore roughly double the work, not quadruple it.
 func TestSanitize_DeeplyNestedDirtyValueIsStillCleaned(t *testing.T) {
 	const depth = 200
 
-	in := any(map[string]any{"note": "bad\x1bhere"})
-	for i := 0; i < depth; i++ {
-		in = map[string]any{"next": in}
+	nest := func(levels int) any {
+		out := any(map[string]any{"note": "bad\x1bhere"})
+		for i := 0; i < levels; i++ {
+			out = map[string]any{"next": out}
+		}
+		return out
 	}
 
+	// Linear, not quadratic. Quadratic would put this near 4.0; linear near 2.0.
+	// The ceiling is deliberately loose — the point is to separate 2 from 4, not
+	// to pin an exact figure that a toolchain change could shift.
+	shallow := testing.AllocsPerRun(5, func() {
+		if _, err := Sanitize(nest(depth)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	deep := testing.AllocsPerRun(5, func() {
+		if _, err := Sanitize(nest(depth * 2)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if ratio := deep / shallow; ratio > 3.0 {
+		t.Errorf("doubling depth multiplied allocations by %.1fx (%.0f -> %.0f); want under 3.0. "+
+			"Cost growing faster than depth means a per-container needsCleaning gate is back "+
+			"and each level is re-scanning its whole subtree.", ratio, shallow, deep)
+	}
+
+	in := nest(depth)
 	out, err := Sanitize(in)
 	if err != nil {
 		t.Fatalf("a deep acyclic value must sanitize, got %v", err)

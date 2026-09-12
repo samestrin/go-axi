@@ -55,8 +55,10 @@ func (e *CycleError) Error() string {
 			"and walking it would exhaust the stack and kill the process", e.Type)
 }
 
-// Sanitize returns a copy of v with every string cleaned of characters that
-// would either break the TOON encoder or reach stdout as a raw control byte.
+// Sanitize returns v with every string cleaned of characters that would either
+// break the TOON encoder or reach stdout as a raw control byte. The result may
+// share memory with v — see the memory paragraph below, which is a contract, not
+// an implementation detail.
 //
 // It exists because toon-go mishandles hostile input in two opposite
 // directions, both confirmed against the pinned version rather than assumed:
@@ -76,19 +78,33 @@ func (e *CycleError) Error() string {
 // Tab, carriage return and newline are deliberately preserved. toon-go already
 // escapes those correctly, and removing them would corrupt multi-line content.
 //
-// The copy preserves concrete types, so struct tags survive. That matters more
-// than it looks: TOON field names are part of the contract consuming tools
-// parse, and flattening a struct to map[string]any would rename every column to
-// its Go identifier. Strings inside unexported fields cannot be reached by
-// reflection and are carried through as-is.
+// Concrete types are preserved, so struct tags survive. That matters more than
+// it looks: TOON field names are part of the contract consuming tools parse, and
+// flattening a struct to map[string]any would rename every column to its Go
+// identifier. Strings inside unexported fields cannot be reached by reflection
+// and are carried through as-is.
 //
-// The input is never MUTATED. What is not promised is that the result occupies
-// different memory: nothing is copied unless a string actually needed cleaning,
-// so for a clean value the result IS the input. A caller that mutates its own
-// value after calling Sanitize should not expect the returned value to stay
-// frozen. This was already true before the copy became conditional — nil
+// MEMORY. The input is never MUTATED, and that is the guarantee callers rely on.
+// What is NOT promised is that the result occupies different memory: nothing is
+// allocated unless a string actually needed cleaning, so for a clean value the
+// result IS v. This was already true before the copy became conditional — nil
 // containers, scalars, funcs, channels and every unexported struct field were
 // always passed through by reference.
+//
+// Two rules follow, and a caller needs both:
+//
+//   - Do not mutate your own value after calling Sanitize and expect the
+//     returned value to stay as it was. There is no compile-time or runtime
+//     signal that the two are the same value.
+//
+//   - Do not mutate it CONCURRENTLY while this call runs, or while the result is
+//     being encoded. Encode, EncodeChecked and EncodeOrJSON pass the result
+//     straight to toon.Marshal, so a clean payload is marshalled from the
+//     caller's own map rather than from a private snapshot. A concurrent write
+//     during that window is a fatal "concurrent map read and map write" that
+//     recover() cannot catch. Rebuilding unconditionally used to hide that race
+//     behind a copy; it never made the caller's code safe, because encoding/json
+//     and every other reflective marshaller carry the identical hazard.
 //
 // Two errors are returned: *CycleError for a self-referential value, and
 // *KeyCollisionError for two map keys that clean to the same string. A caller
@@ -105,6 +121,23 @@ func Sanitize(v any) (any, error) {
 	// two entry points cannot disagree about what counts as a cycle.
 	if hasCycle(rv, map[nodeID]bool{}, 0) {
 		return nil, &CycleError{Type: typeName(reflect.TypeOf(v))}
+	}
+	// The gate, once, at the root. One O(n) scan answers whether anything needs
+	// cleaning at all; if nothing does, v is returned untouched and this call
+	// allocates nothing.
+	//
+	// Gating HERE rather than at every container is what keeps the walk linear.
+	// A per-container gate re-scanned each subtree at every level, so a payload
+	// dirty only at the bottom cost O(n × depth): 3.97 SECONDS for a value nested
+	// 10,000 deep, which is exactly the depth encoding/json accepts before it
+	// rejects at 10,001. It also made ONE hostile byte 23x more expensive than a
+	// payload dirty at every level, because dirt near the top lets each gate exit
+	// early while dirt at the bottom makes every gate scan the whole way down.
+	// One scan at the root is 14ms for that same input, and cheaper on ordinary
+	// payloads too — a fully dirty 500-row listing went from 27,033 allocations
+	// to 11,017, which is also 31% below what it cost before any of this work.
+	if !needsCleaning(rv) {
+		return v, nil
 	}
 	out, _, err := sanitizeValue(rv)
 	if err != nil {
@@ -138,48 +171,26 @@ func SanitizeString(s string) string {
 // needsCleaning reports whether any string at or below v would change, without
 // building anything.
 //
-// This is the gate that stops a clean container being rebuilt. It exists because
-// the obvious alternative — recursing sanitizeValue and discarding the result
-// when nothing changed — allocates the very copies it throws away. Measured on a
-// dirty payload, that cost 48 wasted allocations per row against 0 for this
-// predicate, which exits at the first string needing work and so costs the same
-// whatever the payload size.
+// It is called ONCE, from Sanitize, on the whole value. That placement is the
+// point: it makes the scan O(n). Calling it per container instead — which an
+// earlier version did, to pass clean subtrees through untouched — re-scanned
+// every subtree at every level and turned the walk quadratic, 3.97 seconds for a
+// payload nested 10,000 deep against 14ms for one scan at the root. Sanitize's
+// comment carries the full numbers.
 //
-// On a CLEAN payload it measures 6 allocations per row, identical to hasCycle
-// and to sanitizeValue's own walk. That figure is the reflect map-iteration
-// boxing any walk of a map[string]any must pay; it is the floor, not overhead
-// this adds.
+// It exists because the other way to answer the same question — recursing
+// sanitizeValue and discarding the result when nothing changed — allocates the
+// very copies it throws away, 48 wasted allocations per row on a dirty payload.
+// This predicate allocates nothing of its own and exits at the first string
+// needing work, so it costs the same whatever the payload size.
 //
-// No seen set is needed. Inside Sanitize this runs only after hasCycle has
-// refused every cycle, so the value is acyclic by the time it is reached.
-// sanitizeValue has exactly one non-recursive caller, Sanitize, and the cycle
-// guard runs three lines above it — so there is no path here that skips it.
+// On a CLEAN payload it measures 6 allocations per row, identical to hasCycle.
+// That figure is the reflect map-iteration boxing any walk of a map[string]any
+// must pay; it is the floor, not overhead this adds.
 //
-// COST, stated because it is a real trade and not an oversight. The map and
-// struct branches of sanitizeValue each call this on their own subtree, so
-// detection runs once per container LEVEL: O(n × depth), not O(n). Measured on
-// nested maps with the only dirty string at the deepest leaf — the worst case,
-// since every level must scan all the way down before it can answer:
-//
-//	depth    allocations
-//	10       302
-//	50       3,690
-//	100      12,992
-//	200      48,435
-//
-// Doubling the depth roughly quadruples the cost. The alternative is to gate
-// once at the root, which is O(n) — but then ANY dirty string rebuilds the whole
-// payload. Per-container gating costs 9,064 allocations for one dirty row in
-// 500; rebuilding everything costs about 15,500, and root gating would pay that
-// plus detection. So the level-by-level gate is what makes a mostly-clean
-// payload cheap, which is the case this package exists to serve.
-//
-// The quadratic shape is accepted because it needs nested maps hundreds of
-// levels deep. TOON payloads are rows, two to four levels deep, and the
-// structure comes from the tool rather than from untrusted input — so this is
-// not reachable by anything a caller feeds in. At depth 10 it costs 302
-// allocations. Correctness at depth is pinned by
-// TestSanitize_DeeplyNestedDirtyValueIsStillCleaned.
+// No seen set is needed. It runs only after hasCycle has refused every cycle, so
+// the value is acyclic by the time it is reached — Sanitize calls the guard four
+// lines above, and there is no other caller.
 func needsCleaning(v reflect.Value) bool {
 	if !v.IsValid() {
 		return false
@@ -255,14 +266,16 @@ func needsCleaning(v reflect.Value) bool {
 // stripped version. What is no longer promised is that the result occupies
 // different memory — see Sanitize's doc comment.
 //
-// The map and struct branches gate on needsCleaning rather than recursing to
-// find out whether anything changed. An earlier version of this did recurse and
-// discard the resulting copies, which made a fully dirty payload 1.69x more
-// expensive than before copy-on-write existed — it allocated the rebuild twice.
+// This is reached only when Sanitize's root gate has already established that
+// something in the payload needs cleaning, so every branch rebuilds rather than
+// re-asking. The changed flag still earns its place below the containers: a
+// string that cleans to itself, a nil pointer or an untouched slice element
+// returns the original, so the rebuild copies only what actually moved.
 //
-// The gate applies at every level, not only at the root, so a clean subtree
-// inside a dirty payload is also passed through rather than rebuilt. One dirty
-// row in 500 costs about a third of what rebuilding all 500 would.
+// Do NOT reintroduce a per-container needsCleaning gate to skip clean subtrees.
+// It looks like an obvious win and it is not: each gate re-scans its whole
+// subtree, which makes the walk O(n × depth) and cost 3.97 seconds on a value
+// nested 10,000 deep. Measured, then removed.
 func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 	switch v.Kind() {
 	case reflect.String:
@@ -358,18 +371,6 @@ func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 		if v.IsNil() {
 			return v, false, nil
 		}
-		// A clean map must allocate neither a replacement map nor the
-		// collision-tracking set, and needsCleaning answers that without
-		// building anything.
-		//
-		// No error can be missed by gating here. The only error this branch
-		// raises is *KeyCollisionError, which requires a key that CHANGES when
-		// cleaned — so the predicate reports true for any map that could collide,
-		// and the build pass below still surfaces it.
-		if !needsCleaning(v) {
-			return v, false, nil
-		}
-
 		// Keys are sanitized too. A key is a field name in tabular output, so a
 		// control byte there lands in the header rather than a cell.
 		//
@@ -377,8 +378,11 @@ func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 		// tracked and refused. Map keys are always comparable, so using the
 		// cleaned key in a lookup map is safe.
 		//
-		// Reached only when something changed. A map whose keys all cleaned to
-		// themselves cannot collide, because they were distinct to begin with.
+		// The check cannot be skipped for a map whose own keys happen to be
+		// clean: this branch runs whenever ANYTHING in the payload was dirty, not
+		// only when this map was. A map whose keys all clean to themselves cannot
+		// collide — they were distinct to begin with — so the tracking simply
+		// finds nothing, which costs a little and guarantees the rest.
 		out := reflect.MakeMapWithSize(v.Type(), v.Len())
 		seen := make(map[any]any, v.Len())
 		for iter := v.MapRange(); iter.Next(); {
@@ -405,14 +409,6 @@ func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 
 	case reflect.Struct:
 		t := v.Type()
-		// Same gate as the map branch: a clean struct must not pay for
-		// reflect.New. time.Time is the case that proves it matters — it is
-		// entirely unexported state, so no field can change and it passes
-		// straight through untouched.
-		if !needsCleaning(v) {
-			return v, false, nil
-		}
-
 		// Copy wholesale first so unexported fields survive, then overwrite the
 		// exported ones. reflect can set a whole struct value but not an
 		// individual unexported field, which is why the order matters.
