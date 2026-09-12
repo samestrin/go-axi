@@ -2,9 +2,8 @@
 // github.com/toon-format/toon-go.
 //
 // It is deliberately NOT a codec. toon-go encodes and decodes TOON; this
-// package adds the four things toon-go does not cover, which every
-// agent-facing CLI in this ecosystem needs and currently either duplicates or
-// lacks entirely:
+// package adds the four things toon-go does not cover, which an agent-facing
+// CLI has to get right before it prints:
 //
 //   - Sanitize: hostile input handling. toon-go rejects control bytes below
 //     0x20 with an error but passes U+2028/U+2029, invalid UTF-8, and lone C1

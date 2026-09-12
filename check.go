@@ -78,8 +78,9 @@ var textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 // exclusion Check rejects every payload carrying a timestamp.
 var timeType = reflect.TypeOf(time.Time{})
 
-// maxWalkDepth bounds the value walk. A value can contain a reference cycle,
-// which the type walk terminates via its seen set but the value walk cannot.
+// maxWalkDepth bounds the lossy VALUE walk, which has no seen set of its own.
+// The cycle guard does not use it: hasCycle terminates on identity, and a depth
+// cap there would silently pass a cycle through to the encoder.
 const maxWalkDepth = 100
 
 // isLossyType reports whether toon-go drops values of this type.
@@ -165,10 +166,16 @@ func CheckSanitized(v any, clean any) Verdict {
 	// envelope for a value TOON handles fine.
 	b, err := toon.Marshal(clean)
 	if err != nil {
+		// The alias advice is stated as a CONDITION, not as an instruction. It
+		// used to be appended to every marshal error, so a func or a channel —
+		// which sanitizeValue passes through untouched and which has no TOON
+		// representation under any name — was told to rename itself. atcr's
+		// review flagged the mismatch.
 		return Verdict{
 			Tier: TierLossy,
-			Reason: fmt.Sprintf("%v; toon-go supports plain builtin types only, "+
-				"so declare it as a type alias (=) rather than a defined type", err),
+			Reason: fmt.Sprintf("%v; toon-go supports plain builtin types only — "+
+				"where the type is a defined type over a builtin, declare it as a "+
+				"type alias (=) instead", err),
 		}
 	}
 
@@ -323,14 +330,39 @@ func lossyInValue(v reflect.Value, depth int) string {
 	}
 }
 
+// nodeID identifies a reference-bearing value for the cycle walk.
+//
+// Pointers and maps are identified by address alone. A slice needs its length
+// too: a slice and a sub-slice of it share a data pointer without either
+// containing the other, so keying on the address alone reports a cycle for an
+// ordinary `outer[1] = outer[:1]`. Including the length makes a repeat visit
+// mean the identical slice, which is a genuine loop.
+type nodeID struct {
+	ptr uintptr
+	len int
+}
+
 // hasCycle reports whether v refers to itself, directly or through other nodes.
 //
-// Only maps and pointers are tracked by identity, which is where a Go value can
-// actually close a loop; a slice cannot contain itself without one of those. The
-// seen entry is removed on the way back out, so a node legitimately reachable by
-// two different paths — a DAG, not a cycle — is not mistaken for one.
-func hasCycle(v reflect.Value, seen map[uintptr]bool, depth int) bool {
-	if !v.IsValid() || depth > maxWalkDepth {
+// Pointers, maps AND slices are tracked by identity. A slice looks like it
+// cannot close a loop on its own, and that is wrong: `s := make([]any, 1);
+// s[0] = s` stores a header sharing its own backing array, and walking it
+// recurses forever. Reproduced as a fatal stack overflow before slices were
+// tracked here.
+//
+// The seen entry is removed on the way back out, so a node legitimately
+// reachable by two different paths — a DAG, not a cycle — is not mistaken for
+// one.
+//
+// There is deliberately NO depth cap. An earlier version gave up at
+// maxWalkDepth and returned false, which made the guard a fiction: a chain of
+// ~60 nodes closing back on itself was reported cycle-free, and sanitizeValue —
+// which has neither a depth limit nor a seen-set — then walked it into the exact
+// fatal stack overflow this function exists to prevent. Reproduced before the
+// cap was removed. Termination does not need the cap: every edge that can repeat
+// runs through a pointer, map or slice, and all three are in the seen set.
+func hasCycle(v reflect.Value, seen map[nodeID]bool, depth int) bool {
+	if !v.IsValid() {
 		return false
 	}
 
@@ -339,12 +371,26 @@ func hasCycle(v reflect.Value, seen map[uintptr]bool, depth int) bool {
 		if v.IsNil() {
 			return false
 		}
-		p := v.Pointer()
-		if seen[p] {
+		id := nodeID{ptr: v.Pointer()}
+		if seen[id] {
 			return true
 		}
-		seen[p] = true
-		defer delete(seen, p)
+		seen[id] = true
+		defer delete(seen, id)
+
+	case reflect.Slice:
+		// An empty slice is not tracked. Zero-length allocations share one
+		// address (runtime.zerobase), so tracking them collides unrelated
+		// slices — and a slice with no elements cannot recurse anyway.
+		if v.IsNil() || v.Len() == 0 {
+			break
+		}
+		id := nodeID{ptr: v.Pointer(), len: v.Len()}
+		if seen[id] {
+			return true
+		}
+		seen[id] = true
+		defer delete(seen, id)
 	}
 
 	switch v.Kind() {

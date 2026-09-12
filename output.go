@@ -48,10 +48,9 @@ func Encode(w io.Writer, v any) error {
 // would make a command's output format vary with payload length, which no
 // consumer could predict and every consumer would have to handle both ways.
 //
-// Note for cadence: its STYLE.md prohibits runtime format detection, fixing the
-// format per command at design time. This function is that prohibited thing, so
-// cadence should keep its build-time guards and simply not call it. It exists
-// for callers that have no such rule.
+// This is runtime format detection. A project that fixes the output format per
+// command at design time should keep its build-time guard and not call this.
+// It exists for callers that have no such rule.
 func EncodeOrJSON(w io.Writer, v any) error {
 	// Sanitized ONCE, for both the routing decision and whichever payload wins.
 	// This used to call Check (which sanitizes internally) and then Encode (which
@@ -101,8 +100,8 @@ func encodeSanitized(w io.Writer, clean any) error {
 // The form is the inline TOON array, `help[2]: first,second`, chosen because it
 // is the only one of the three in circulation that survives its own codec. The
 // AXI specification's own indented example fails to decode with "list length
-// mismatch", and cadence's `help[] line` form fails with "missing colon after
-// key". Appending this after a body is safe: the combined payload decodes as one
+// mismatch", and the `help[] line` form fails with "missing colon after key".
+// Appending this after a body is safe: the combined payload decodes as one
 // value carrying both.
 //
 // An empty list writes nothing. A command with no meaningful next step should

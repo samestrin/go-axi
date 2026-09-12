@@ -1,6 +1,7 @@
 package goaxi
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
@@ -160,4 +161,59 @@ func TestSanitize_NestedCollisionPropagates(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A key collision must propagate through every public entry point, not just
+// Sanitize. Check, Encode and EncodeOrJSON each route Sanitize's error, and only
+// the *CycleError branch was covered — so a regression that handled cycles and
+// dropped collisions would have passed the suite. atcr's review flagged the gap.
+func TestKeyCollisionPropagatesThroughEveryEntryPoint(t *testing.T) {
+	// Both keys clean to "name", so one would silently overwrite the other.
+	collide := func() map[string]any {
+		return map[string]any{"na\x1bme": 1, "name": 2}
+	}
+
+	t.Run("Check", func(t *testing.T) {
+		got := Check(collide())
+		if got.OK {
+			t.Error("a key collision must not be reported OK")
+		}
+		if got.Tier != TierLossy {
+			t.Errorf("tier = %v, want lossy", got.Tier)
+		}
+	})
+
+	t.Run("CanEncode", func(t *testing.T) {
+		if CanEncode(collide()) {
+			t.Error("a key collision must not be reported encodable")
+		}
+	})
+
+	t.Run("Encode", func(t *testing.T) {
+		var buf bytes.Buffer
+		err := Encode(&buf, collide())
+
+		var dup *KeyCollisionError
+		if !errors.As(err, &dup) {
+			t.Fatalf("err = %v, want *KeyCollisionError", err)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("nothing may be written on refusal, got %q", buf.String())
+		}
+	})
+
+	t.Run("EncodeOrJSON", func(t *testing.T) {
+		var buf bytes.Buffer
+		err := EncodeOrJSON(&buf, collide())
+
+		var dup *KeyCollisionError
+		if !errors.As(err, &dup) {
+			t.Fatalf("err = %v, want *KeyCollisionError", err)
+		}
+		// The JSON envelope is NOT an escape hatch for a collision: the fallback
+		// would silently drop a key exactly as TOON would.
+		if buf.Len() != 0 {
+			t.Errorf("nothing may be written on refusal, got %q", buf.String())
+		}
+	})
 }
