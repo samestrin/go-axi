@@ -95,7 +95,7 @@ func Sanitize(v any) (any, error) {
 	// seen-set, so a cycle never reaches the error return — it exhausts the
 	// stack and kills the process. This reuses the detector Check uses, so the
 	// two entry points cannot disagree about what counts as a cycle.
-	if hasCycle(rv, map[uintptr]bool{}, 0) {
+	if hasCycle(rv, map[nodeID]bool{}, 0) {
 		return nil, &CycleError{Type: typeName(reflect.TypeOf(v))}
 	}
 	out, err := sanitizeValue(rv)

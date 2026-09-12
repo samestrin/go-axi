@@ -61,3 +61,90 @@ func TestSanitize_AcceptsASharedNodeThatIsNotACycle(t *testing.T) {
 		t.Fatalf("Sanitize refused a shared node: %v", err)
 	}
 }
+
+// A cycle deeper than the old maxWalkDepth cap. hasCycle used to return false
+// at depth 100, so this chain was reported cycle-free and sanitizeValue — which
+// has no depth limit and no seen-set — walked it into a fatal stack overflow.
+// atcr's review caught it as HIGH (greta) and MEDIUM (kai, dax), and it was
+// reproduced exactly that way before the cap was removed.
+//
+// If this test ever crashes the suite instead of failing, the cap is back.
+func TestSanitize_RefusesACycleDeeperThanTheOldDepthCap(t *testing.T) {
+	const n = 200 // each node costs two levels of walk depth; the old cap was 100
+
+	nodes := make([]*cycNode, n)
+	for i := range nodes {
+		nodes[i] = &cycNode{Name: "n"}
+	}
+	for i := 0; i < n-1; i++ {
+		nodes[i].Next = nodes[i+1]
+	}
+	nodes[n-1].Next = nodes[0]
+
+	if _, err := Sanitize(nodes[0]); err == nil {
+		t.Fatal("a cycle deeper than the walk cap must be refused")
+	}
+	if Check(nodes[0]).OK {
+		t.Error("a cycle deeper than the walk cap must not be reported OK")
+	}
+}
+
+// A chain of the same depth that does NOT close must still be accepted. Refusing
+// every deep value would trade the crash for a guard that lies about legitimate
+// data.
+func TestSanitize_AcceptsADeepAcyclicChain(t *testing.T) {
+	const n = 200
+
+	head := &cycNode{Name: "n"}
+	cur := head
+	for i := 1; i < n; i++ {
+		cur.Next = &cycNode{Name: "n"}
+		cur = cur.Next
+	}
+
+	if _, err := Sanitize(head); err != nil {
+		t.Fatalf("a deep but acyclic chain must be accepted, got %v", err)
+	}
+}
+
+// A slice that contains itself closes a loop with no pointer and no map. hasCycle
+// tracked only pointers and maps, so this reached sanitizeValue and killed the
+// process with a stack overflow.
+//
+// If this test ever crashes the suite instead of failing, slice identity
+// tracking is gone.
+func TestSanitize_RefusesASelfContainingSlice(t *testing.T) {
+	s := make([]any, 1)
+	s[0] = s
+
+	if _, err := Sanitize(s); err == nil {
+		t.Fatal("a slice containing itself must be refused")
+	}
+	if Check(s).OK {
+		t.Error("a slice containing itself must not be reported OK")
+	}
+}
+
+// A sub-slice shares its parent's backing array without either containing the
+// other. Keying the seen set on the data pointer alone reports this as a cycle;
+// the length is what keeps the two apart.
+func TestSanitize_SubSliceSharingABackingArrayIsNotACycle(t *testing.T) {
+	outer := make([]any, 2)
+	outer[0] = "a"
+	outer[1] = outer[:1]
+
+	if _, err := Sanitize(outer); err != nil {
+		t.Fatalf("a sub-slice is not a cycle, got %v", err)
+	}
+}
+
+// The same slice reached twice by two different paths is a DAG, not a cycle. The
+// seen entry has to be popped on the way back out for this to pass.
+func TestSanitize_SliceReachedTwiceIsNotACycle(t *testing.T) {
+	shared := []any{"a", "b"}
+	outer := []any{shared, shared}
+
+	if _, err := Sanitize(outer); err != nil {
+		t.Fatalf("a slice reached by two paths is not a cycle, got %v", err)
+	}
+}
