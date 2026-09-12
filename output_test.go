@@ -375,6 +375,136 @@ func TestWriteLine_EmptyBodyWritesNothing(t *testing.T) {
 	}
 }
 
+// --- output path cost ------------------------------------------------------
+
+// jsonSizeProbe counts how many times encoding/json reaches it.
+//
+// It implements json.Marshaler ONLY, never encoding.TextMarshaler, so the two
+// lossy walks must not flag it and the value stays on the lossless TOON path.
+// Confirmed by probe: Check reports OK at tier "nested".
+//
+// This is the only way to observe the size comparison from outside the package.
+// Verdict.Efficient is computed by marshalling the entire payload a second time
+// as JSON purely to compare byte counts, and nothing on the output path reads
+// the answer.
+type jsonSizeProbe struct {
+	hits *int
+	Name string `toon:"name" json:"name"`
+}
+
+func (p jsonSizeProbe) MarshalJSON() ([]byte, error) {
+	*p.hits++
+	return []byte(`"probed"`), nil
+}
+
+// EncodeOrJSON must not pay for a TOON-vs-JSON size comparison it never reads.
+//
+// Check computes Verdict.Efficient by marshalling the whole payload as JSON. That
+// number is a real diagnostic for a caller asking "would JSON be cheaper for this
+// command", and cadence asserts on it at 20 sites, so Check must keep computing
+// it. But EncodeOrJSON routes on verdict.OK alone and discards Efficient. On a
+// 2000-row listing that throwaway marshal measured 0.56ms and 14,008 allocations.
+func TestEncodeOrJSON_DoesNotMeasureSizeOnTheLosslessPath(t *testing.T) {
+	hits := 0
+	v := map[string]any{
+		"path":  "/some/dir",
+		"probe": jsonSizeProbe{hits: &hits, Name: "row"},
+	}
+
+	// Guard the probe itself. If this fixture ever stops being lossless the test
+	// would be asserting about the envelope branch and could pass for the wrong
+	// reason.
+	if got := Check(v); !got.OK {
+		t.Fatalf("fixture must stay lossless or the probe watches the wrong branch, got %q", got.Reason)
+	}
+	if hits == 0 {
+		t.Fatal("probe is broken: Check must reach MarshalJSON, or there is nothing here to observe")
+	}
+
+	hits = 0
+	if err := EncodeOrJSON(io.Discard, v); err != nil {
+		t.Fatalf("EncodeOrJSON: %v", err)
+	}
+	if hits != 0 {
+		t.Errorf("EncodeOrJSON must not marshal the payload as JSON to compare sizes; MarshalJSON was called %d time(s)", hits)
+	}
+}
+
+// EncodeOrJSON must marshal the payload as TOON once, not twice.
+//
+// CheckSanitized marshals to reach its verdict and throws the bytes away;
+// encodeSanitized then marshals the identical value again in order to write it.
+// Measured on a 2000-row listing, the duplicate cost 0.97ms and 33,939
+// allocations.
+//
+// Counted in allocations rather than wall time, because allocation counts are
+// deterministic. Compared against EncodeChecked measured in the same run, for the
+// reasons set out at the assertion below — an absolute ceiling is hostage to the
+// runtime, and a ratio against Encode fires whenever Encode gets faster.
+func TestEncodeOrJSON_DoesNotMarshalTheSameValueTwice(t *testing.T) {
+	v := losslessRows(200)
+
+	if got := Check(v); !got.OK {
+		t.Fatalf("fixture must be lossless, got %q", got.Reason)
+	}
+
+	// Compared against EncodeChecked in the SAME run — not against an absolute
+	// count, and not against Encode. Both of those shapes were tried here and both
+	// were wrong, in opposite directions.
+	//
+	// An absolute AllocsPerRun ceiling is hostage to the runtime: a toolchain that
+	// changes how reflect boxes map iteration fails the suite with no code change
+	// and no signal about the property being guarded. That is the shape
+	// sanitize_bench_test.go rejects in so many words, and an earlier version of
+	// this very test used one regardless.
+	//
+	// Dividing by Encode fails the other way. Encode is actively being optimised,
+	// so a shrinking denominator fires this test while EncodeOrJSON is perfectly
+	// fine — which already happened once on this branch.
+	//
+	// EncodeChecked is the reference that holds. On the lossless path it does
+	// exactly what EncodeOrJSON does: sanitize once, marshal once, derive the
+	// verdict from those bytes. So the two track each other whatever the runtime
+	// or the codec does. Measured at 2000 rows they are identical, 57,996
+	// allocations each. A reinstated second marshal inside EncodeOrJSON would add
+	// a whole encode, roughly 79% more, so 1.15x separates them with room to spare.
+	//
+	// The JSON-size-comparison half of the invariant is not this test's job. That
+	// is counted exactly, by MarshalJSON call, in the test above.
+	checked := testing.AllocsPerRun(20, func() {
+		if _, err := EncodeChecked(io.Discard, v); err != nil {
+			t.Fatalf("EncodeChecked: %v", err)
+		}
+	})
+	both := testing.AllocsPerRun(20, func() {
+		if err := EncodeOrJSON(io.Discard, v); err != nil {
+			t.Fatalf("EncodeOrJSON: %v", err)
+		}
+	})
+
+	const maxRatio = 1.15
+	if ratio := both / checked; ratio > maxRatio {
+		t.Errorf("EncodeOrJSON allocates %.2fx what EncodeChecked does (%.0f vs %.0f), "+
+			"want at most %.2fx. Both sanitize once and marshal once on this path, so a "+
+			"gap this wide means EncodeOrJSON is marshalling the value twice.",
+			ratio, both, checked, maxRatio)
+	}
+}
+
+// losslessRows builds a uniform listing of the shape a real command emits: a
+// scalar key or two beside a list of rows.
+func losslessRows(n int) map[string]any {
+	rows := make([]any, 0, n)
+	for i := 0; i < n; i++ {
+		rows = append(rows, map[string]any{
+			"id":    i,
+			"name":  fmt.Sprintf("row-%d", i),
+			"state": "open",
+		})
+	}
+	return map[string]any{"path": "/some/dir", "total": n, "rows": rows}
+}
+
 // A value that cannot be encoded at all must report an error rather than write a
 // partial payload. A truncated payload is worse than none: it parses.
 func TestEncode_RefusesRatherThanWritePartialOutput(t *testing.T) {

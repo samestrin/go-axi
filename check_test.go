@@ -82,6 +82,147 @@ func TestCheck_FindsTextMarshalerAtAnyDepth(t *testing.T) {
 	}
 }
 
+// "AtAnyDepth" above used to overpromise. lossyInValue bounded itself with a
+// depth cap and returned "" at depth 100 — and "" MEANS "no loss found", so past
+// the cap the guard gave a clean bill of health to a payload whose value toon-go
+// drops. Probed against the pinned version, the boundary was exact:
+//
+//	layers of []any   Check.OK   value walk found it
+//	49                false      true
+//	50                true       false
+//	200               true       false
+//	1000              true       false
+//
+// Deleting the cap finds the marshaler at every one of those depths, so the cap
+// is the sole cause. The type walk cannot cover for it: lossyInType skips
+// interface types deliberately, and every layer below map[string]any is an
+// `any`.
+//
+// 50 nested layers is pathological, not something a listing produces. It is
+// still the exact failure this package exists to catch — the key prints, the
+// value is gone — and a guard that answers "fine" is worse than no guard.
+func TestCheck_FindsALossyTypeBelowTheOldDepthCap(t *testing.T) {
+	// Each layer costs two levels of walk depth: the slice, then the interface
+	// holding the next layer. 60 layers clears a cap of 100 with margin.
+	nest := func(layers int, leaf any) any {
+		out := leaf
+		for i := 0; i < layers; i++ {
+			out = []any{out}
+		}
+		return out
+	}
+
+	// 49 is included so a fix cannot regress the shallow case it already caught.
+	for _, layers := range []int{49, 60, 200} {
+		v := map[string]any{"rows": nest(layers, textMarshaler{v: "SECRET"})}
+		if got := Check(v); got.OK {
+			t.Errorf("a TextMarshaler under %d layers of []any must be reported lossy, got OK at tier %v",
+				layers, got.Tier)
+		}
+	}
+}
+
+// The depth cap was replaced by a seen set keyed on node identity, and that
+// swap has two ways to go wrong in opposite directions. Both are covered here
+// because neither is visible in the percentage: the walk can INVENT loss by
+// mis-keying unrelated nodes together, or HIDE loss by skipping a node before
+// its subtree was fully explored.
+//
+// Memoizing is sound only because a repeat visit means the identical subtree:
+// the entry is written after the node is entered and never removed, so a "" for
+// a seen node is a result already computed, not a guess. Type keying would not
+// be sound, and was the bug that shipped once — see lossyInValue's comment.
+func TestCheck_NodeMemoizationNeitherHidesNorInventsLoss(t *testing.T) {
+	// A shared slice exercises the slice memoization hit; the nil map and nil
+	// pointer exercise the nil guard in the identity-tracking switch. A nil
+	// *textMarshaler would NOT reach that guard — a value-receiver method set
+	// belongs to the pointer type too, so isLossyType flags it first.
+	t.Run("shared and nil nodes are not reported lossy", func(t *testing.T) {
+		shared := []any{"a", "b"}
+		var nilMap map[string]any
+		var nilPtr *struct {
+			X string `toon:"x"`
+		}
+		got := Check(map[string]any{
+			"first":  shared,
+			"second": shared,
+			"absent": nilMap,
+			"gone":   nilPtr,
+		})
+		if !got.OK {
+			t.Errorf("shared and nil nodes must not be reported lossy, got %q", got.Reason)
+		}
+	})
+
+	// The direction that matters. If the walk ever marked a node seen BEFORE
+	// exploring it, or reused a "" from a partial visit, the loss inside a
+	// twice-reached node would vanish silently.
+	t.Run("a lossy type inside a twice-reached node is still found", func(t *testing.T) {
+		shared := []any{textMarshaler{v: "SECRET"}}
+		got := Check(map[string]any{"first": shared, "second": shared})
+		if got.OK {
+			t.Error("memoizing a repeated node must not skip the loss inside it")
+		}
+	})
+}
+
+// The seen set made lossy detection depend on two edges it never depended on
+// before, and this repo's history says both are exactly where identity tracking
+// breaks: a pointer used as a map KEY, and two slices sharing one backing array.
+// The cycle guard has a regression test for each; lossy detection had neither.
+//
+// Promoted here after an adversarial pass failed to break them, so the cases
+// that were probed once do not have to be probed again by hand.
+func TestCheck_MemoizationDoesNotHideLossOnTheHardEdges(t *testing.T) {
+	type keyed struct {
+		M textMarshaler `toon:"m"`
+	}
+
+	// A pointer key is the one construction that reaches the key branch. A map
+	// key must be comparable, which rules out using a map or slice directly, and
+	// a pointer is comparable regardless of what it points at. Repeated because
+	// map iteration order is randomized, so a bug could hide in whichever
+	// position happens to be visited second and mark the node seen first.
+	t.Run("behind a pointer map key", func(t *testing.T) {
+		key := &keyed{M: textMarshaler{v: "SECRET"}}
+		nested := map[string]any{
+			"asValue": key,
+			"asKey":   map[*keyed]int{key: 1},
+		}
+		for i := 0; i < 100; i++ {
+			if got := Check(nested); got.OK {
+				t.Fatalf("loss must be found whether the node arrives as key or value, got OK at tier %v", got.Tier)
+			}
+		}
+	})
+
+	// outer[0:1] shares its parent's data pointer. Keyed on the address alone the
+	// sub-slice would mask the parent, and the lossy element at index 1 — outside
+	// the sub-slice — would never be walked. The length is what keeps them apart.
+	t.Run("outside a sub-slice sharing a backing array", func(t *testing.T) {
+		outer := []any{"ok", keyed{M: textMarshaler{v: "SECRET"}}}
+		for i := 0; i < 100; i++ {
+			if got := Check(map[string]any{"sub": outer[0:1], "outer": outer}); got.OK {
+				t.Fatalf("loss at an index outside the sub-slice must still be found, got OK at tier %v", got.Tier)
+			}
+		}
+	})
+
+	// Zero-length slices are deliberately untracked, because zero-length
+	// allocations share one address (runtime.zerobase) and tracking them would
+	// collide unrelated slices. That choice must not mask a sibling.
+	t.Run("beside untracked empty slices", func(t *testing.T) {
+		got := Check(map[string]any{
+			"a": []any{},
+			"b": []any{},
+			"c": []any{keyed{M: textMarshaler{v: "SECRET"}}},
+		})
+		if got.OK {
+			t.Error("an empty-slice sibling must not mask a loss")
+		}
+	})
+}
+
 // A defined string type fails loudly rather than silently, but it still cannot
 // be encoded, so Check must report it as unusable with a reason that names the
 // documented workaround.
