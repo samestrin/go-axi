@@ -226,7 +226,8 @@ func TestSanitize_DeeplyNestedPointers(t *testing.T) {
 // Aliasing was already true before this change for nil containers, scalars,
 // funcs, channels and every unexported struct field. What changed is that it now
 // also holds for a populated map, slice or struct that needed no cleaning.
-func TestSanitize_CleanValueIsReturnedNotCopied(t *testing.T) {
+// Split from its dirty-path twin below so a failure names which half broke.
+func TestSanitize_CleanValueIsReturnedByIdentity(t *testing.T) {
 	in := map[string]any{"rows": []any{map[string]any{"name": "ok"}}}
 
 	got, ok := MustSanitize(in).(map[string]any)
@@ -236,10 +237,14 @@ func TestSanitize_CleanValueIsReturnedNotCopied(t *testing.T) {
 	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(in).Pointer() {
 		t.Error("a clean map must be returned as-is, not rebuilt into an identical copy")
 	}
+}
 
-	// The other direction: a value that does need cleaning must still be
-	// rebuilt, and the caller's copy left alone.
+// The other direction, and the one that proves the optimisation did not simply
+// stop sanitizing: a value that needs cleaning is still rebuilt into separate
+// memory, cleaned, and the caller's own copy left untouched.
+func TestSanitize_DirtyValueIsRebuilt(t *testing.T) {
 	dirty := map[string]any{"name": "a\x1bb"}
+
 	cleaned, ok := MustSanitize(dirty).(map[string]any)
 	if !ok {
 		t.Fatalf("map must stay a map[string]any, got %T", MustSanitize(dirty))

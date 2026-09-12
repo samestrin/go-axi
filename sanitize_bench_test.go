@@ -86,47 +86,32 @@ func BenchmarkSanitizeString(b *testing.B) {
 
 // A payload with nothing to clean must not pay to be copied.
 //
-// sanitizeValue rebuilds every container node by node even when no string
-// changed, producing a result identical to the input. Measured at 500 rows, that
-// copy is 12,524 of Sanitize's 15,530 allocations — 80.6% of the total.
-//
-// Stated as MARGINAL allocations per row rather than a total, so the number is
-// independent of the fixed cost of one call and of the machine running it. It
-// also names no internal function, so merging or renaming the walks cannot break
-// this test.
-//
-// The floor is not zero. Sanitize walks a clean payload once, via inspect, and
-// that single traversal costs 6.0 allocations per row of reflect map-iteration
-// boxing — a cost any reflective walk of a map[string]any pays, not overhead this
-// package adds. So 6.0 is the floor and 31.0 was the starting point.
-//
-// Two earlier versions of this bound were wrong, both recorded because the
-// mistakes are instructive. The first was an absolute 10.0 per row, from counting
-// one walk when there were two — the cycle guard and the dirtiness check ran
-// separately then, 6.0 each, so the real floor was 12.0. The second was absolute
-// at all, which three reviewers flagged: AllocsPerRun counts are a runtime
-// implementation detail, so a toolchain that changes how MapRange allocates fails
-// the suite with no code change. Hence the ratio below.
+// Measured as MARGINAL allocations per row, so the figure is independent of the
+// fixed cost of one call and of the machine running it — and it names no internal
+// function, so merging or renaming the walks cannot break this test.
 func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 	clean := allocationsPerRow(t, false)
 	dirty := allocationsPerRow(t, true)
 
-	// Compared against the DIRTY path measured in the same run, not against a
-	// fixed number. Both figures are dominated by reflect map-iteration boxing,
-	// which is a runtime implementation detail: a toolchain that changes how
-	// MapRange allocates moves both together and the ratio holds, where an
-	// absolute ceiling would fail the suite with no code change at all.
+	// FLOOR. Not zero. Sanitize walks a clean payload once, via inspect, and that
+	// single traversal costs 6.0 allocations per row of reflect map-iteration
+	// boxing — what any reflective walk of a map[string]any pays, not overhead
+	// this package adds. 6.0 is the floor; 31.0 was the starting point.
 	//
-	// Reinstating the unconditional copy puts clean at 31.0 against roughly 32.0
-	// dirty — a ratio near 0.97, because then both paths rebuild everything and
-	// the clean case has nothing left to save.
+	// WHY A RATIO against the dirty path measured in the SAME run, rather than a
+	// fixed count. Both figures are dominated by that same boxing, so a toolchain
+	// changing how MapRange allocates moves them together and the ratio holds,
+	// where an absolute ceiling fails the suite with no code change at all. Two
+	// earlier bounds here were absolute and both were wrong — 10.0, from counting
+	// one walk when there were two, then 15.0, which three reviewers flagged.
 	//
-	// The bound is tighter than that, because it also pins the number of WALKS a
-	// clean payload pays for. Two separate traversals of the same value — a cycle
-	// guard and then a dirtiness check — measured 12.0 against 22.0 dirty, a
-	// ratio of 0.55. One traversal answering both questions measures about 6.0,
-	// a ratio near 0.27. At 0.40 this fails if either the copy comes back or the
-	// walks split apart again.
+	// WHY 0.40. Reinstating the unconditional copy puts clean at 31.0 against
+	// roughly 32.0 dirty, a ratio near 0.97: both paths rebuild everything and the
+	// clean case has nothing left to save. The bound is tighter than that because
+	// it also pins the number of WALKS — two separate traversals measured 12.0
+	// against 22.0 dirty, a ratio of 0.55, where one traversal answering both
+	// questions measures about 6.0, a ratio near 0.27. At 0.40 this fails if
+	// either the copy returns or the walks split apart again.
 	const maxShare = 0.40
 
 	if share := clean / dirty; share > maxShare {

@@ -56,9 +56,33 @@ func (e *CycleError) Error() string {
 }
 
 // Sanitize returns v with every string cleaned of characters that would either
-// break the TOON encoder or reach stdout as a raw control byte. The result may
-// share memory with v — see the memory paragraph below, which is a contract, not
-// an implementation detail.
+// break the TOON encoder or reach stdout as a raw control byte.
+//
+// # Memory
+//
+// The input is never MUTATED, and that is the guarantee callers rely on. What is
+// NOT promised is that the result occupies different memory: nothing is allocated
+// unless a string actually needed cleaning, so for a clean value the result IS v.
+// This was already true before the copy became conditional — nil containers,
+// scalars, funcs, channels and every unexported struct field were always passed
+// through by reference.
+//
+// Two rules follow, and a caller needs both:
+//
+//   - Do not mutate your own value after calling Sanitize and expect the
+//     returned value to stay as it was. There is no compile-time or runtime
+//     signal that the two are the same value.
+//
+//   - Do not mutate it CONCURRENTLY while this call runs, or while the result is
+//     being encoded. Encode, EncodeChecked and EncodeOrJSON pass the result
+//     straight to toon.Marshal, so a clean payload is marshalled from the
+//     caller's own map rather than from a private snapshot. A concurrent write
+//     during that window is a fatal "concurrent map read and map write" that
+//     recover() cannot catch. Rebuilding unconditionally used to hide that race
+//     behind a copy; it never made the caller's code safe, because encoding/json
+//     and every other reflective marshaller carry the identical hazard.
+//
+// # Why it exists
 //
 // It exists because toon-go mishandles hostile input in two opposite
 // directions, both confirmed against the pinned version rather than assumed:
@@ -83,28 +107,6 @@ func (e *CycleError) Error() string {
 // flattening a struct to map[string]any would rename every column to its Go
 // identifier. Strings inside unexported fields cannot be reached by reflection
 // and are carried through as-is.
-//
-// MEMORY. The input is never MUTATED, and that is the guarantee callers rely on.
-// What is NOT promised is that the result occupies different memory: nothing is
-// allocated unless a string actually needed cleaning, so for a clean value the
-// result IS v. This was already true before the copy became conditional — nil
-// containers, scalars, funcs, channels and every unexported struct field were
-// always passed through by reference.
-//
-// Two rules follow, and a caller needs both:
-//
-//   - Do not mutate your own value after calling Sanitize and expect the
-//     returned value to stay as it was. There is no compile-time or runtime
-//     signal that the two are the same value.
-//
-//   - Do not mutate it CONCURRENTLY while this call runs, or while the result is
-//     being encoded. Encode, EncodeChecked and EncodeOrJSON pass the result
-//     straight to toon.Marshal, so a clean payload is marshalled from the
-//     caller's own map rather than from a private snapshot. A concurrent write
-//     during that window is a fatal "concurrent map read and map write" that
-//     recover() cannot catch. Rebuilding unconditionally used to hide that race
-//     behind a copy; it never made the caller's code safe, because encoding/json
-//     and every other reflective marshaller carry the identical hazard.
 //
 // Two errors are returned: *CycleError for a self-referential value, and
 // *KeyCollisionError for two map keys that clean to the same string. A caller
@@ -351,24 +353,39 @@ func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 		return out, true, nil
 
 	case reflect.Struct:
+		// Allocate on the FIRST changed field, exactly as the slice and array
+		// branches do. This branch used to rebuild unconditionally and report
+		// changed=true whatever its fields said, which made the returned flag a
+		// lie: every ancestor pointer, interface, slice and array then allocated
+		// a copy nothing below it needed. A struct whose fields all come back
+		// unchanged is now passed through.
 		t := v.Type()
-		// Copy wholesale first so unexported fields survive, then overwrite the
-		// exported ones. reflect can set a whole struct value but not an
-		// individual unexported field, which is why the order matters.
-		out := reflect.New(v.Type()).Elem()
-		out.Set(v)
+		var out reflect.Value
 		for i := 0; i < t.NumField(); i++ {
 			if t.Field(i).PkgPath != "" {
+				continue // unexported; unreachable by reflection
+			}
+			field, fieldChanged, err := sanitizeValue(v.Field(i))
+			if err != nil {
+				return reflect.Value{}, false, err
+			}
+			if !fieldChanged {
 				continue
+			}
+			if !out.IsValid() {
+				// Copy wholesale so unexported fields survive, then overwrite the
+				// exported ones. reflect can set a whole struct value but not an
+				// individual unexported field, which is why the order matters.
+				out = reflect.New(v.Type()).Elem()
+				out.Set(v)
 			}
 			// No CanSet guard: out came from reflect.New(...).Elem() so it is
 			// addressable, and unexported fields were skipped above, so every
 			// field reaching here is settable by construction.
-			field, _, err := sanitizeValue(v.Field(i))
-			if err != nil {
-				return reflect.Value{}, false, err
-			}
 			out.Field(i).Set(field)
+		}
+		if !out.IsValid() {
+			return v, false, nil
 		}
 		return out, true, nil
 
