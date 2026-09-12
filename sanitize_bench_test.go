@@ -2,6 +2,7 @@ package goaxi
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -80,6 +81,56 @@ func BenchmarkSanitizeString(b *testing.B) {
 				_ = SanitizeString(c.in)
 			}
 		})
+	}
+}
+
+// A payload with nothing to clean must not pay to be copied.
+//
+// sanitizeValue rebuilds every container node by node even when no string
+// changed, producing a result identical to the input. Measured at 500 rows, that
+// copy is 12,524 of Sanitize's 15,530 allocations — 80.6% of the total.
+//
+// Stated as MARGINAL allocations per row rather than a total, so the number is
+// independent of the fixed cost of one call and of the machine running it. It
+// also names no internal function, so merging or renaming the walks cannot break
+// this test.
+//
+// Sanitize walks twice: the cycle guard, then the copy. The cycle guard's own
+// marginal cost is about 6 allocations per row, from reflect map-iteration
+// boxing, and returning the input instead of copying it cannot remove that. So
+// 6.0 is the floor, not 0. Measured baseline before the fix: 31.0 per row.
+func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
+	const (
+		small     = 20
+		large     = 500
+		maxPerRow = 10.0
+	)
+
+	allocsFor := func(n int) float64 {
+		v := benchRows(n, false)
+
+		// Guard the fixture. If it ever stops being clean this measures the
+		// dirty path, where copying is unavoidable and the number is meaningless.
+		clean, err := Sanitize(v)
+		if err != nil {
+			t.Fatalf("fixture must sanitize without error: %v", err)
+		}
+		if !reflect.DeepEqual(clean, v) {
+			t.Fatal("fixture must need no cleaning, or this measures the copy of a dirty value")
+		}
+
+		return testing.AllocsPerRun(50, func() {
+			if _, err := Sanitize(v); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	perRow := (allocsFor(large) - allocsFor(small)) / float64(large-small)
+	if perRow > maxPerRow {
+		t.Errorf("Sanitize allocates %.1f times per row for a payload with nothing to clean, "+
+			"want at most %.1f. A clean value is being rebuilt node by node into a copy "+
+			"identical to the input.", perRow, maxPerRow)
 	}
 }
 
