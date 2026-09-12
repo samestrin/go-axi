@@ -459,12 +459,24 @@ func TestEncodeOrJSON_DoesNotMarshalTheSameValueTwice(t *testing.T) {
 		}
 	})
 
-	const maxRatio = 1.25
-	if ratio := both / encode; ratio > maxRatio {
-		t.Errorf("EncodeOrJSON allocates %.2fx Encode (%.0f vs %.0f allocs), want at most %.2fx. "+
-			"A ratio this high means the value is still marshalled twice, or the JSON "+
-			"size comparison is still running on the output path.",
-			ratio, both, encode, maxRatio)
+	// Asserted as an absolute per-row DELTA rather than a ratio. A ratio divides
+	// by Encode, so it also fires when Encode gets cheaper — which is exactly what
+	// happened here when the copy-on-write sanitizer landed, and it would have
+	// failed this test while EncodeOrJSON was unchanged and still marshalling
+	// once. The delta measures the guard's own cost and nothing else.
+	//
+	// The guard is one lossy walk over the payload: 6.1 allocations per row
+	// measured. A reinstated second marshal would add the whole encode cost,
+	// about 29 per row; a reinstated JSON size comparison would add about 7.
+	const (
+		rows         = 200
+		maxPerRowAdd = 10.0
+	)
+	if perRow := (both - encode) / float64(rows); perRow > maxPerRowAdd {
+		t.Errorf("the guard adds %.1f allocations per row (%.0f vs %.0f over %d rows), "+
+			"want at most %.1f. A cost this high means the value is still marshalled "+
+			"twice, or the JSON size comparison is still running on the output path.",
+			perRow, both, encode, rows, maxPerRowAdd)
 	}
 }
 
