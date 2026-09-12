@@ -95,15 +95,22 @@ func BenchmarkSanitizeString(b *testing.B) {
 // also names no internal function, so merging or renaming the walks cannot break
 // this test.
 //
-// Sanitize walks twice: the cycle guard, then the copy. The cycle guard's own
-// marginal cost is about 6 allocations per row, from reflect map-iteration
-// boxing, and returning the input instead of copying it cannot remove that. So
-// 6.0 is the floor, not 0. Measured baseline before the fix: 31.0 per row.
+// The floor is not zero, and it is not 6 either. Sanitize makes TWO passes over
+// a clean payload — the cycle guard, then needsCleaning — and each independently
+// pays 6 allocations per row of reflect map-iteration boxing. Measured
+// separately, hasCycle, needsCleaning and sanitizeValue's own walk all cost
+// exactly 6.0 per row on the same fixture, so 12.0 is the floor for a two-walk
+// design and the only route below it is merging the walks.
+//
+// This ceiling was first written as 10.0, from counting one walk instead of two.
+// The measured numbers are 31.0 per row before the fix and 12.0 after, so the
+// copy is entirely gone; 15.0 leaves headroom above the floor without letting a
+// reinstated copy pass, which would show up at 31.0.
 func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 	const (
 		small     = 20
 		large     = 500
-		maxPerRow = 10.0
+		maxPerRow = 15.0
 	)
 
 	allocsFor := func(n int) float64 {
@@ -131,6 +138,57 @@ func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 		t.Errorf("Sanitize allocates %.1f times per row for a payload with nothing to clean, "+
 			"want at most %.1f. A clean value is being rebuilt node by node into a copy "+
 			"identical to the input.", perRow, maxPerRow)
+	}
+}
+
+// Making the clean path cheap must not be paid for by the dirty path.
+//
+// The first attempt at skipping the copy decided whether a container had changed
+// by recursing sanitizeValue and discarding the copies it built. That allocated
+// the whole rebuild twice: a fully dirty payload went from 32.0 to 54.0
+// allocations per row, 1.69x worse than before the optimization existed, and it
+// was not a cold path either — one dirty string makes every ancestor container
+// dirty. needsCleaning answers the same question without building anything and
+// exits at the first string that needs work.
+//
+// Measured: 32.0 per row before any of this, 54.0 with the discarding version,
+// 27.0 now. The ceiling of 35.0 would have failed the discarding version while
+// still admitting the original unconditional copy, because what this guards is
+// the double build, not the copy itself — the clean-path test above is what
+// requires the copy to be skipped.
+func TestSanitize_DirtyPayloadDoesNotPayTwice(t *testing.T) {
+	const (
+		small     = 20
+		large     = 500
+		maxPerRow = 35.0
+	)
+
+	allocsFor := func(n int) float64 {
+		v := benchRows(n, true)
+
+		// Guard the fixture from the opposite direction to the clean test: this
+		// one is meaningless unless sanitizing really does change the value.
+		cleaned, err := Sanitize(v)
+		if err != nil {
+			t.Fatalf("fixture must sanitize without error: %v", err)
+		}
+		if reflect.DeepEqual(cleaned, v) {
+			t.Fatal("fixture must need cleaning, or this measures the clean path")
+		}
+
+		return testing.AllocsPerRun(50, func() {
+			if _, err := Sanitize(v); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	perRow := (allocsFor(large) - allocsFor(small)) / float64(large-small)
+	if perRow > maxPerRow {
+		t.Errorf("Sanitize allocates %.1f times per row for a payload that needs cleaning, "+
+			"want at most %.1f. A cost this high means the rebuild is being allocated "+
+			"twice — once to decide whether anything changed, once to build the result.",
+			perRow, maxPerRow)
 	}
 }
 

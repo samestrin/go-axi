@@ -212,3 +212,45 @@ func TestSanitize_DeeplyNestedPointers(t *testing.T) {
 		t.Errorf("the caller's nested value must not be mutated, got %q", in.In.Note)
 	}
 }
+
+// A value with nothing to clean is returned as-is rather than rebuilt, so the
+// result SHARES memory with the input.
+//
+// This is the one contract that changed when the copy became conditional.
+// Non-mutation is unaffected and is pinned by TestSanitize_DoesNotMutateInput
+// above; what is no longer promised is that the result occupies different
+// memory. Asserted by identity rather than inferred from an allocation count,
+// because identity is the property a caller can actually observe — and four
+// downstream consumers could be relying on the old behaviour.
+//
+// Aliasing was already true before this change for nil containers, scalars,
+// funcs, channels and every unexported struct field. What changed is that it now
+// also holds for a populated map, slice or struct that needed no cleaning.
+func TestSanitize_CleanValueIsReturnedNotCopied(t *testing.T) {
+	in := map[string]any{"rows": []any{map[string]any{"name": "ok"}}}
+
+	got, ok := MustSanitize(in).(map[string]any)
+	if !ok {
+		t.Fatalf("map must stay a map[string]any, got %T", MustSanitize(in))
+	}
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(in).Pointer() {
+		t.Error("a clean map must be returned as-is, not rebuilt into an identical copy")
+	}
+
+	// The other direction: a value that does need cleaning must still be
+	// rebuilt, and the caller's copy left alone.
+	dirty := map[string]any{"name": "a\x1bb"}
+	cleaned, ok := MustSanitize(dirty).(map[string]any)
+	if !ok {
+		t.Fatalf("map must stay a map[string]any, got %T", MustSanitize(dirty))
+	}
+	if reflect.ValueOf(cleaned).Pointer() == reflect.ValueOf(dirty).Pointer() {
+		t.Error("a dirty map must be rebuilt, not returned as-is")
+	}
+	if cleaned["name"] != "ab" {
+		t.Errorf("the dirty value must be cleaned, got %q", cleaned["name"])
+	}
+	if dirty["name"] != "a\x1bb" {
+		t.Errorf("the caller's value must not be mutated, got %q", dirty["name"])
+	}
+}
