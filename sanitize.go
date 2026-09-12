@@ -152,6 +152,34 @@ func SanitizeString(s string) string {
 //
 // No seen set is needed. Inside Sanitize this runs only after hasCycle has
 // refused every cycle, so the value is acyclic by the time it is reached.
+// sanitizeValue has exactly one non-recursive caller, Sanitize, and the cycle
+// guard runs three lines above it — so there is no path here that skips it.
+//
+// COST, stated because it is a real trade and not an oversight. The map and
+// struct branches of sanitizeValue each call this on their own subtree, so
+// detection runs once per container LEVEL: O(n × depth), not O(n). Measured on
+// nested maps with the only dirty string at the deepest leaf — the worst case,
+// since every level must scan all the way down before it can answer:
+//
+//	depth    allocations
+//	10       302
+//	50       3,690
+//	100      12,992
+//	200      48,435
+//
+// Doubling the depth roughly quadruples the cost. The alternative is to gate
+// once at the root, which is O(n) — but then ANY dirty string rebuilds the whole
+// payload. Per-container gating costs 9,064 allocations for one dirty row in
+// 500; rebuilding everything costs about 15,500, and root gating would pay that
+// plus detection. So the level-by-level gate is what makes a mostly-clean
+// payload cheap, which is the case this package exists to serve.
+//
+// The quadratic shape is accepted because it needs nested maps hundreds of
+// levels deep. TOON payloads are rows, two to four levels deep, and the
+// structure comes from the tool rather than from untrusted input — so this is
+// not reachable by anything a caller feeds in. At depth 10 it costs 302
+// allocations. Correctness at depth is pinned by
+// TestSanitize_DeeplyNestedDirtyValueIsStillCleaned.
 func needsCleaning(v reflect.Value) bool {
 	if !v.IsValid() {
 		return false

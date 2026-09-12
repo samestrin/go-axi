@@ -254,3 +254,114 @@ func TestSanitize_CleanValueIsReturnedNotCopied(t *testing.T) {
 		t.Errorf("the caller's value must not be mutated, got %q", dirty["name"])
 	}
 }
+
+// needsCleaning gates the entire copy, so if it ever answers "no" for a value
+// sanitizing WOULD have changed, a control byte reaches output and this package
+// has failed at its one job. The agreement between the predicate and the walk is
+// therefore the load-bearing invariant of copy-on-write, and it is asserted
+// across every shape the walk handles rather than spot-checked.
+//
+// The oracle is deliberately NOT the predicate's own logic. It compares the
+// sanitized result against the input with reflect.DeepEqual, which is what a
+// caller can actually observe — and DeepEqual inspects unexported fields, so the
+// carried-through-as-is cases are covered too.
+func TestSanitize_PredicateAgreesWithTheWalk(t *testing.T) {
+	type inner struct {
+		Note   string `toon:"note"`
+		hidden string
+	}
+	type outer struct {
+		In  *inner    `toon:"in"`
+		Arr [2]string `toon:"arr"`
+	}
+
+	shapes := []struct {
+		name string
+		in   any
+	}{
+		{"clean string", "hello"},
+		{"dirty string", "a\x1bb"},
+		{"clean map", map[string]any{"a": "ok", "n": 1}},
+		{"dirty map value", map[string]any{"a": "x\x1by"}},
+		{"dirty map key", map[string]any{"a\x1bb": "ok"}},
+		{"clean slice", []any{"a", "b"}},
+		{"dirty slice element", []any{"a", "b\x1bc"}},
+		{"clean nested", map[string]any{"rows": []any{map[string]any{"k": "v"}}}},
+		{"dirty nested", map[string]any{"rows": []any{map[string]any{"k": "v\x1b"}}}},
+		{"clean struct", outer{In: &inner{Note: "ok"}, Arr: [2]string{"a", "b"}}},
+		{"dirty struct field", outer{In: &inner{Note: "a\x1bb"}, Arr: [2]string{"a", "b"}}},
+		{"dirty array element", outer{In: &inner{Note: "ok"}, Arr: [2]string{"a", "b\x1b"}}},
+		{"dirty unexported field only", inner{Note: "ok", hidden: "a\x1bb"}},
+		{"nil containers", map[string]any{"m": map[string]any(nil), "s": []any(nil), "p": (*inner)(nil)}},
+		{"empty containers", map[string]any{"m": map[string]any{}, "s": []any{}}},
+		{"scalars", map[string]any{"i": 42, "f": 3.5, "b": true}},
+		{"line separator", "end\u2028sep"},
+		{"invalid utf8", "ab\xffcd"},
+		{"genuine replacement char", "a\ufffdb"},
+		{"preserved whitespace", "a\nb\tc\rd"},
+	}
+
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			predicate := needsCleaning(reflect.ValueOf(s.in))
+
+			out, err := Sanitize(s.in)
+			if err != nil {
+				t.Fatalf("Sanitize: %v", err)
+			}
+			changed := !reflect.DeepEqual(out, s.in)
+
+			if predicate != changed {
+				t.Errorf("needsCleaning said %v but sanitizing changed the value: %v\n  in  = %#v\n  out = %#v",
+					predicate, changed, s.in, out)
+			}
+		})
+	}
+}
+
+// Depth must not defeat cleaning. The gate runs once per container level, so a
+// deep value is scanned repeatedly — that cost is documented on needsCleaning
+// and accepted. What must never happen is the value coming back uncleaned, or
+// the walk failing to terminate.
+//
+// 200 levels is far past anything a TOON payload produces (rows are two to four
+// levels deep) and is chosen to sit well beyond the depth cap that used to
+// bound the lossy walk, so a reinstated cap of any similar size would fail here
+// rather than silently pass the dirty string through.
+func TestSanitize_DeeplyNestedDirtyValueIsStillCleaned(t *testing.T) {
+	const depth = 200
+
+	in := any(map[string]any{"note": "bad\x1bhere"})
+	for i := 0; i < depth; i++ {
+		in = map[string]any{"next": in}
+	}
+
+	out, err := Sanitize(in)
+	if err != nil {
+		t.Fatalf("a deep acyclic value must sanitize, got %v", err)
+	}
+
+	// Walk back down to the leaf and prove the escape is gone.
+	cur, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("root must stay a map[string]any, got %T", out)
+	}
+	for i := 0; i < depth; i++ {
+		cur, ok = cur["next"].(map[string]any)
+		if !ok {
+			t.Fatalf("level %d must stay a map[string]any, got %T", i, cur["next"])
+		}
+	}
+	if got := cur["note"]; got != "badhere" {
+		t.Errorf("the string at depth %d must be cleaned, got %#v", depth, got)
+	}
+
+	// And the caller's copy is untouched, however deep it was reached.
+	cin := in.(map[string]any)
+	for i := 0; i < depth; i++ {
+		cin = cin["next"].(map[string]any)
+	}
+	if got := cin["note"]; got != "bad\x1bhere" {
+		t.Errorf("the caller's value at depth %d must not be mutated, got %#v", depth, got)
+	}
+}
