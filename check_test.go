@@ -82,6 +82,46 @@ func TestCheck_FindsTextMarshalerAtAnyDepth(t *testing.T) {
 	}
 }
 
+// "AtAnyDepth" above overpromises. lossyInValue gives up at maxWalkDepth and
+// returns "", which MEANS "no loss found" — so past the cap the guard reports a
+// clean bill of health for a payload whose value toon-go drops. Probed against
+// the pinned version, the boundary is exact:
+//
+//	layers of []any   Check.OK   value walk found it
+//	49                false      true
+//	50                true       false
+//	200               true       false
+//	1000              true       false
+//
+// Deleting the cap finds the marshaler at every one of those depths, so the cap
+// is the sole cause. The type walk cannot cover for it: lossyInType skips
+// interface types deliberately, and every layer below map[string]any is an
+// `any`.
+//
+// 50 nested layers is pathological, not something a listing produces. It is
+// still the exact failure this package exists to catch — the key prints, the
+// value is gone — and a guard that answers "fine" is worse than no guard.
+func TestCheck_FindsALossyTypeBelowTheOldDepthCap(t *testing.T) {
+	// Each layer costs two levels of walk depth: the slice, then the interface
+	// holding the next layer. 60 layers clears a cap of 100 with margin.
+	nest := func(layers int, leaf any) any {
+		out := leaf
+		for i := 0; i < layers; i++ {
+			out = []any{out}
+		}
+		return out
+	}
+
+	// 49 is included so a fix cannot regress the shallow case it already caught.
+	for _, layers := range []int{49, 60, 200} {
+		v := map[string]any{"rows": nest(layers, textMarshaler{v: "SECRET"})}
+		if got := Check(v); got.OK {
+			t.Errorf("a TextMarshaler under %d layers of []any must be reported lossy, got OK at tier %v",
+				layers, got.Tier)
+		}
+	}
+}
+
 // A defined string type fails loudly rather than silently, but it still cannot
 // be encoded, so Check must report it as unusable with a reason that names the
 // documented workaround.

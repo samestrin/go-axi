@@ -148,3 +148,44 @@ func TestSanitize_SliceReachedTwiceIsNotACycle(t *testing.T) {
 		t.Fatalf("a slice reached by two paths is not a cycle, got %v", err)
 	}
 }
+
+// A cyclic value that ALSO carries a lossy type must still be refused as a
+// cycle.
+//
+// This guards one specific way of merging the two read-only walks. hasCycle and
+// lossyInValue traverse identical edges, so folding them into a single pass is
+// the obvious saving — but a merged walk that RETURNS EARLY on the lossy finding
+// never reaches the cycle. Sanitize would then see no cycle, proceed into
+// sanitizeValue, which has neither a seen-set nor a depth limit, and exhaust the
+// stack. That is a fatal runtime error rather than a panic: recover() cannot
+// catch it, so the process dies with a goroutine dump instead of returning an
+// error to the caller.
+//
+// A merged walk must therefore record the first lossy reason and KEEP WALKING,
+// and the cycle answer must win. This passes today because Sanitize runs the
+// cycle guard before any lossy walk exists on the path; it is here so that stays
+// true.
+//
+// If this test ever crashes the suite instead of failing, a merged walk is
+// short-circuiting on the lossy branch.
+func TestSanitize_CyclicValueCarryingALossyTypeIsRefusedAsACycle(t *testing.T) {
+	type node struct {
+		M    textMarshaler `toon:"m"`
+		Next *node         `toon:"next"`
+	}
+	n := &node{M: textMarshaler{v: "PAYLOAD"}}
+	n.Next = n
+
+	_, err := Sanitize(n)
+	if err == nil {
+		t.Fatal("a cyclic value must be refused even when it also carries a lossy type")
+	}
+	var ce *CycleError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error must be *CycleError, not the lossy reason: got %T: %v", err, err)
+	}
+
+	if Check(n).OK {
+		t.Error("a cyclic value must not be reported OK, whatever else it carries")
+	}
+}
