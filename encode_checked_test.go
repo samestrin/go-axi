@@ -13,9 +13,9 @@ import (
 // away, and Encode then sanitized and marshalled the identical value again — on
 // a 2000-row payload, 2.27x the allocations of encoding alone, for one guard.
 //
-// Measured before and after on the same payload: 6.96ms -> 3.30ms at 2000 rows,
-// 325us -> 176us at 100. The guard itself is ~19% over a bare Encode; the rest
-// was duplication.
+// Measured medians before and after: 7.18ms -> 3.32ms at 2000 rows, 338us ->
+// 156us at 100. Against a bare Encode as the floor the guard now costs ~14%,
+// where the pair cost ~147%. The difference was duplication, not safety.
 func TestEncodeChecked_EmitsTheSameBytesAsEncode(t *testing.T) {
 	v := map[string]any{"rows": []any{
 		map[string]any{"id": 1, "name": "a"},

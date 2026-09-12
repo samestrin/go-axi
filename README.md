@@ -85,10 +85,20 @@ Full reference: [pkg.go.dev/github.com/samestrin/go-axi](https://pkg.go.dev/gith
 | Function | Behavior |
 |---|---|
 | `Encode(w io.Writer, v any) error` | Sanitize, encode as TOON, terminate with exactly one newline |
+| `EncodeChecked(w io.Writer, v any) (Verdict, error)` | Sanitize, verify TOON carries it losslessly, write it — one pass for both jobs |
 | `EncodeOrJSON(w io.Writer, v any) error` | Same, but fall back to a JSON envelope when TOON would lose data |
 | `WriteHelp(w io.Writer, lines []string) error` | Write `help[N]: first,second`; an empty list writes nothing |
 
 `Encode` sanitizes internally so a caller cannot forget, and writes nothing at all when encoding fails — a partial payload is worse than none, because it parses.
+
+`EncodeChecked` is what you want when the guard matters and you are about to print. Calling `Check` and then `Encode` sanitizes and marshals the same value twice to serve one guard; `EncodeChecked` derives its verdict from the bytes it writes. Measured medians, with a bare `Encode` as the floor:
+
+| rows | `Encode` | `EncodeChecked` | `Check` + `Encode` |
+|---|---|---|---|
+| 100 | 134 µs | 156 µs (+16%) | 338 µs (+152%) |
+| 2000 | 2.91 ms | 3.32 ms (+14%) | 7.18 ms (+147%) |
+
+It writes nothing unless the verdict is `OK`, and its `Tier` describes the bytes actually emitted.
 
 `EncodeOrJSON` falls back on **data loss only, never on size**, to a self-describing envelope:
 
@@ -104,10 +114,11 @@ If your project fixes the output format per command at design time, `EncodeOrJSO
 
 ```go
 type Verdict struct {
-	OK        bool   // encoding preserves the data
-	Tier      Tier   // TierTabular | TierNested | TierLossy
-	Efficient bool   // the TOON payload is no larger than the JSON one
-	Reason    string // explains a false OK or Efficient, in actionable terms
+	OK           bool   // encoding preserves the data
+	Tier         Tier   // TierTabular | TierNested | TierLossy
+	Efficient    bool   // the TOON payload is no larger than the JSON one
+	SizeCompared bool   // whether Efficient was actually measured
+	Reason       string // explains a false OK or Efficient, in actionable terms
 }
 
 func Check(v any) Verdict                     // sanitizes internally
@@ -122,6 +133,8 @@ func CanEncode(v any) bool                    // Check(v).OK
 | `TierLossy` | Encoding would discard data. Do not emit this as TOON |
 
 Tiers describe the shape actually emitted, measured rather than assumed.
+
+`SizeCompared` exists because the comparison costs a second marshal, so `EncodeChecked` skips it. Without the flag, a skipped comparison would be indistinguishable from a measured "TOON is larger". `Check` always measures.
 
 `OK` and `Efficient` are separate on purpose. A payload can be perfectly lossless and still cost more as TOON, which is a reason to choose JSON for that command but never a reason to call the value broken.
 
@@ -214,7 +227,8 @@ Principles 2, 3, 4, 7, 8 and 10 are per-command design decisions and stay with t
 
 - **Round-trip is a build failure.** `Decode(Encode(Sanitize(v)))` must equal `Sanitize(v)`. Codec pairs tested only against frozen fixtures go stale in silence.
 - **One write per payload.** A body and its terminating newline land in a single `Write` call, so a closed pipe cannot deliver a payload missing its last byte.
-- **Nothing on failure.** `Encode` writes zero bytes when encoding fails.
+- **Nothing on failure.** `Encode` writes zero bytes when encoding fails, and `EncodeChecked` writes zero bytes unless the verdict is `OK`.
+- **One pass per payload.** `EncodeChecked` and `EncodeOrJSON` sanitize once and marshal once, deriving their verdict from the bytes they write rather than from a second encode.
 - **Input is never mutated.** `Sanitize` returns a copy.
 - **No output means no output.** An empty body and an empty help list write nothing, not a blank line an agent pays tokens to read.
 
