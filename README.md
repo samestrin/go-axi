@@ -229,7 +229,7 @@ Principles 2, 3, 4, 7, 8 and 10 are per-command design decisions and stay with t
 - **One write per payload.** A body and its terminating newline land in a single `Write` call, so a closed pipe cannot deliver a payload missing its last byte.
 - **Nothing on failure.** `Encode` writes zero bytes when encoding fails, and `EncodeChecked` writes zero bytes unless the verdict is `OK`.
 - **One pass per payload.** `EncodeChecked` and `EncodeOrJSON` sanitize once and marshal once, deriving their verdict from the bytes they write rather than from a second encode.
-- **Input is never mutated.** `Sanitize` returns a copy.
+- **Input is never mutated.** `Sanitize` never writes to the value you hand it. It does not promise a *distinct* copy: nothing is allocated unless a string actually needs cleaning, so for a clean value the result shares memory with the input. Do not mutate your own value afterwards and expect the returned one to stay frozen. Nil containers, scalars, funcs, channels and unexported struct fields were always shared this way; a populated map, slice or struct that needed no cleaning now is too.
 - **No output means no output.** An empty body and an empty help list write nothing, not a blank line an agent pays tokens to read.
 
 ## Development
