@@ -5,8 +5,8 @@ import "fmt"
 // ExitCode is the process exit status an agent-facing CLI returns.
 //
 // These ship as constants rather than as a rule in a style guide because a
-// documented convention drifts and a compiled constant cannot. The values are
-// cadence-axi's set, which is a superset of atcr's 0/1/2.
+// documented convention drifts and a compiled constant cannot. The set extends
+// the conventional 0/1/2 with two codes agent-facing tools need to distinguish.
 type ExitCode int
 
 const (
