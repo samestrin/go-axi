@@ -437,10 +437,10 @@ func TestEncodeOrJSON_DoesNotMeasureSizeOnTheLosslessPath(t *testing.T) {
 // Measured on a 2000-row listing, the duplicate cost 0.97ms and 33,939
 // allocations.
 //
-// Counted in allocations rather than wall time because allocation counts are
-// deterministic, and expressed as a RATIO against Encode rather than an absolute
-// so the test survives a different machine or a codec that allocates differently.
-// Measured baseline before the fix: 1.63x. Measured prototype after: 1.13x.
+// Counted in allocations rather than wall time, because allocation counts are
+// deterministic. Compared against EncodeChecked measured in the same run, for the
+// reasons set out at the assertion below — an absolute ceiling is hostage to the
+// runtime, and a ratio against Encode fires whenever Encode gets faster.
 func TestEncodeOrJSON_DoesNotMarshalTheSameValueTwice(t *testing.T) {
 	v := losslessRows(200)
 
@@ -448,9 +448,32 @@ func TestEncodeOrJSON_DoesNotMarshalTheSameValueTwice(t *testing.T) {
 		t.Fatalf("fixture must be lossless, got %q", got.Reason)
 	}
 
-	encode := testing.AllocsPerRun(20, func() {
-		if err := Encode(io.Discard, v); err != nil {
-			t.Fatalf("Encode: %v", err)
+	// Compared against EncodeChecked in the SAME run — not against an absolute
+	// count, and not against Encode. Both of those shapes were tried here and both
+	// were wrong, in opposite directions.
+	//
+	// An absolute AllocsPerRun ceiling is hostage to the runtime: a toolchain that
+	// changes how reflect boxes map iteration fails the suite with no code change
+	// and no signal about the property being guarded. That is the shape
+	// sanitize_bench_test.go rejects in so many words, and an earlier version of
+	// this very test used one regardless.
+	//
+	// Dividing by Encode fails the other way. Encode is actively being optimised,
+	// so a shrinking denominator fires this test while EncodeOrJSON is perfectly
+	// fine — which already happened once on this branch.
+	//
+	// EncodeChecked is the reference that holds. On the lossless path it does
+	// exactly what EncodeOrJSON does: sanitize once, marshal once, derive the
+	// verdict from those bytes. So the two track each other whatever the runtime
+	// or the codec does. Measured at 2000 rows they are identical, 57,996
+	// allocations each. A reinstated second marshal inside EncodeOrJSON would add
+	// a whole encode, roughly 79% more, so 1.15x separates them with room to spare.
+	//
+	// The JSON-size-comparison half of the invariant is not this test's job. That
+	// is counted exactly, by MarshalJSON call, in the test above.
+	checked := testing.AllocsPerRun(20, func() {
+		if _, err := EncodeChecked(io.Discard, v); err != nil {
+			t.Fatalf("EncodeChecked: %v", err)
 		}
 	})
 	both := testing.AllocsPerRun(20, func() {
@@ -459,24 +482,12 @@ func TestEncodeOrJSON_DoesNotMarshalTheSameValueTwice(t *testing.T) {
 		}
 	})
 
-	// Asserted as an absolute per-row DELTA rather than a ratio. A ratio divides
-	// by Encode, so it also fires when Encode gets cheaper — which is exactly what
-	// happened here when the copy-on-write sanitizer landed, and it would have
-	// failed this test while EncodeOrJSON was unchanged and still marshalling
-	// once. The delta measures the guard's own cost and nothing else.
-	//
-	// The guard is one lossy walk over the payload: 6.1 allocations per row
-	// measured. A reinstated second marshal would add the whole encode cost,
-	// about 29 per row; a reinstated JSON size comparison would add about 7.
-	const (
-		rows         = 200
-		maxPerRowAdd = 10.0
-	)
-	if perRow := (both - encode) / float64(rows); perRow > maxPerRowAdd {
-		t.Errorf("the guard adds %.1f allocations per row (%.0f vs %.0f over %d rows), "+
-			"want at most %.1f. A cost this high means the value is still marshalled "+
-			"twice, or the JSON size comparison is still running on the output path.",
-			perRow, both, encode, rows, maxPerRowAdd)
+	const maxRatio = 1.15
+	if ratio := both / checked; ratio > maxRatio {
+		t.Errorf("EncodeOrJSON allocates %.2fx what EncodeChecked does (%.0f vs %.0f), "+
+			"want at most %.2fx. Both sanitize once and marshal once on this path, so a "+
+			"gap this wide means EncodeOrJSON is marshalling the value twice.",
+			ratio, both, checked, maxRatio)
 	}
 }
 

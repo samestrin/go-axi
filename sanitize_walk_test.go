@@ -351,13 +351,21 @@ func TestSanitize_DeeplyNestedDirtyValueIsStillCleaned(t *testing.T) {
 	// Linear, not quadratic. Quadratic would put this near 4.0; linear near 2.0.
 	// The ceiling is deliberately loose — the point is to separate 2 from 4, not
 	// to pin an exact figure that a toolchain change could shift.
+	// Fixtures are built ONCE, outside the measured closures. Constructing them
+	// inside counts 200 and 400 map allocations as part of the measurement, and
+	// because that construction cost is itself linear in depth it inflates both
+	// sides of the ratio equally — masking the quadratic regression this ratio is
+	// the only guard against.
+	shallowV := nest(depth)
+	deepV := nest(depth * 2)
+
 	shallow := testing.AllocsPerRun(5, func() {
-		if _, err := Sanitize(nest(depth)); err != nil {
+		if _, err := Sanitize(shallowV); err != nil {
 			t.Fatal(err)
 		}
 	})
 	deep := testing.AllocsPerRun(5, func() {
-		if _, err := Sanitize(nest(depth * 2)); err != nil {
+		if _, err := Sanitize(deepV); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -395,5 +403,54 @@ func TestSanitize_DeeplyNestedDirtyValueIsStillCleaned(t *testing.T) {
 	}
 	if got := cin["note"]; got != "bad\x1bhere" {
 		t.Errorf("the caller's value at depth %d must not be mutated, got %#v", depth, got)
+	}
+}
+
+// Sanitizing must not change any concrete type, and nothing enforced that until
+// this test.
+//
+// verdictFor runs its lossy VALUE walk over the raw argument while every
+// measurement below it — the TOON marshal, the tabular-header match, the size
+// comparison — runs over the sanitized copy. Those two only agree because
+// sanitizeValue preserves concrete types at every node. That equivalence was
+// relied upon by parallel code in two files and asserted nowhere, so a future
+// branch that flattened or retyped a node would make Check judge a value that is
+// not the one Encode emits, silently and with no failing test.
+//
+// Raised by an external review, which proposed exactly this assertion. The
+// alternative it offered — walk the sanitized copy instead of the raw value — is
+// the wrong fix: lossyInType needs the DECLARED type to catch a lossy type
+// sitting in an empty or nil container, which holds no values to inspect.
+func TestSanitize_PreservesConcreteTypes(t *testing.T) {
+	type holder struct {
+		Note string `toon:"note"`
+	}
+
+	shapes := []struct {
+		name string
+		in   any
+	}{
+		{"dirty string", "a\x1bb"},
+		{"dirty map value", map[string]any{"k": "a\x1bb"}},
+		{"dirty map key", map[string]any{"a\x1bb": 1}},
+		{"dirty slice element", []any{"a\x1bb"}},
+		{"dirty array element", [2]string{"a\x1bb", "ok"}},
+		{"dirty struct field", holder{Note: "a\x1bb"}},
+		{"dirty behind a pointer", &holder{Note: "a\x1bb"}},
+		{"dirty nested in rows", map[string]any{"r": []any{map[string]any{"k": "a\x1bb"}}}},
+		{"pointer used as a map key", map[*holder]int{{Note: "a\x1bb"}: 1}},
+		{"clean value passed through", map[string]any{"k": "ok"}},
+	}
+
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			out, err := Sanitize(s.in)
+			if err != nil {
+				t.Fatalf("Sanitize: %v", err)
+			}
+			if got, want := reflect.TypeOf(out), reflect.TypeOf(s.in); got != want {
+				t.Errorf("concrete type changed: %v became %v", want, got)
+			}
+		})
 	}
 }
