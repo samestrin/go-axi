@@ -315,13 +315,15 @@ func lossyInValue(v reflect.Value, seen map[nodeID]bool) string {
 		return lossyReason(v.Type())
 	}
 
-	// Identity is tracked for the three reference-bearing kinds, matching
-	// hasCycle so the two walks cannot disagree about which edges repeat.
+	// Identity is tracked for the three reference-bearing kinds, matching inspect
+	// so the two walks cannot disagree about which edges can repeat.
 	//
-	// Unlike hasCycle the entry is NOT removed on the way back out. hasCycle asks
-	// "is this node on my current path", which needs the pop; this walk asks "is
-	// there a loss anywhere below", and a node already proven clean stays clean
-	// however it is reached again.
+	// Unlike inspect the entry is NOT removed on the way back out, and that
+	// difference is why the two cannot share one set. inspect asks "is this node
+	// on my current path", which requires popping or every DAG looks like a
+	// cycle; this walk asks "is there a loss anywhere below", so a node already
+	// proven clean stays clean however it is reached again and the entry is kept
+	// as a memo. Opposite policies, deliberately separate walks.
 	switch v.Kind() {
 	case reflect.Map, reflect.Pointer:
 		if v.IsNil() {
@@ -409,26 +411,53 @@ type nodeID struct {
 	len int
 }
 
-// hasCycle reports whether v refers to itself, directly or through other nodes.
+// inspect walks v ONCE and answers both questions Sanitize must ask before it
+// can act: does the value refer to itself, and does anything in it need
+// cleaning.
 //
-// Pointers, maps AND slices are tracked by identity. A slice looks like it
-// cannot close a loop on its own, and that is wrong: `s := make([]any, 1);
+// Those two checks visit exactly the same nodes across exactly the same edges,
+// so running them as separate passes walked every payload twice — 12 allocations
+// per row on a clean listing where a single walk costs 6. Merging them also
+// retires a standing hazard an external review named: separate walkers whose
+// edge sets had to stay identical forever, enforced by nothing but comments and
+// the hope that whoever edits one remembers the others.
+//
+// CYCLES. Pointers, maps AND slices are tracked by identity. A slice looks like
+// it cannot close a loop on its own, and that is wrong: `s := make([]any, 1);
 // s[0] = s` stores a header sharing its own backing array, and walking it
 // recurses forever. Reproduced as a fatal stack overflow before slices were
 // tracked here.
 //
-// The seen entry is removed on the way back out, so a node legitimately
-// reachable by two different paths — a DAG, not a cycle — is not mistaken for
-// one.
+// The path entry is removed on the way back out, so a node legitimately
+// reachable by two different routes — a DAG, not a cycle — is not mistaken for
+// one. That popping is also why this cannot share its set with lossyInValue,
+// which KEEPS entries in order to memoize subtrees it has already cleared. The
+// two need opposite policies, so they stay separate on purpose; merging those
+// would silently break one of them.
 //
-// There is deliberately NO depth cap. An earlier version gave up at
-// maxWalkDepth and returned false, which made the guard a fiction: a chain of
-// ~60 nodes closing back on itself was reported cycle-free, and sanitizeValue —
-// which has neither a depth limit nor a seen-set — then walked it into the exact
-// fatal stack overflow this function exists to prevent. Reproduced before the
-// cap was removed. Termination does not need the cap: every edge that can repeat
-// runs through a pointer, map or slice, and all three are in the seen set.
-func hasCycle(v reflect.Value, seen map[nodeID]bool, depth int) bool {
+// There is deliberately NO depth cap. An earlier version gave up at a fixed
+// depth and returned false, which made the guard a fiction: a chain of ~60 nodes
+// closing back on itself was reported cycle-free, and sanitizeValue — which has
+// neither a depth limit nor a seen-set — then walked it into the exact fatal
+// stack overflow this exists to prevent. Termination does not need a cap: every
+// edge that can repeat runs through a pointer, map or slice, and all three are
+// tracked.
+//
+// THE WALK MUST NOT SHORT-CIRCUIT ON DIRTINESS. Returning the moment a string is
+// found to need cleaning would leave the rest of the value unvisited, so a cycle
+// further along would go undetected, Sanitize would proceed, and sanitizeValue
+// would exhaust the stack — fatal, and recover() cannot catch it. Only a CYCLE
+// may return early, because Sanitize refuses the value outright in that case and
+// never reads the flag.
+//
+// The flag is threaded by POINTER rather than returned, so that once dirtiness is
+// established the string nodes stop calling cleanString while the walk carries on
+// visiting every edge. Accumulating it as a return value instead cost 1,500
+// redundant string scans on a fully dirty 500-row listing — sanitizeValue scans
+// each string again during the rebuild — and measured 602us against 350us for
+// this form, with allocations unchanged. The answer is identical either way; only
+// the wasted scanning differs.
+func inspect(v reflect.Value, path map[nodeID]bool, dirty *bool) (cycle bool) {
 	if !v.IsValid() {
 		return false
 	}
@@ -439,11 +468,11 @@ func hasCycle(v reflect.Value, seen map[nodeID]bool, depth int) bool {
 			return false
 		}
 		id := nodeID{ptr: v.Pointer()}
-		if seen[id] {
+		if path[id] {
 			return true
 		}
-		seen[id] = true
-		defer delete(seen, id)
+		path[id] = true
+		defer delete(path, id)
 
 	case reflect.Slice:
 		// An empty slice is not tracked. Zero-length allocations share one
@@ -453,37 +482,49 @@ func hasCycle(v reflect.Value, seen map[nodeID]bool, depth int) bool {
 			break
 		}
 		id := nodeID{ptr: v.Pointer(), len: v.Len()}
-		if seen[id] {
+		if path[id] {
 			return true
 		}
-		seen[id] = true
-		defer delete(seen, id)
+		path[id] = true
+		defer delete(path, id)
 	}
 
 	switch v.Kind() {
+	case reflect.String:
+		// Skipped once the answer is already known — see the pointer note above.
+		// cleanString returns its argument unchanged when there is nothing to
+		// strip, so this comparison is a pointer check in the common case.
+		if !*dirty {
+			s := v.String()
+			if cleanString(s) != s {
+				*dirty = true
+			}
+		}
+		return false
+
 	case reflect.Pointer, reflect.Interface:
 		if v.IsNil() {
 			return false
 		}
-		return hasCycle(v.Elem(), seen, depth+1)
+		return inspect(v.Elem(), path, dirty)
 
 	case reflect.Map:
 		iter := v.MapRange()
 		for iter.Next() {
-			// KEYS are walked as well as values, and that is load-bearing. A map
-			// key can be a pointer, and a pointer is comparable regardless of
-			// what it points at, so a cycle can close entirely through keys.
+			// KEYS are walked as well as values, and that is load-bearing twice
+			// over. A map key can be a pointer, and a pointer is comparable
+			// regardless of what it points at, so a cycle can close entirely
+			// through keys. A key is also a field name in tabular output, so a
+			// control byte there lands in the header rather than in a cell.
 			//
 			// sanitizeValue recurses into keys with no seen-set of its own, so a
-			// key-reachable cycle that this pre-check misses is not merely
-			// undetected — it exhausts the stack and kills the process, which
-			// recover() cannot catch. Reproduced exactly that way before this
-			// line existed. The pre-check and the walker must traverse identical
-			// edges or the guard is a fiction.
-			if hasCycle(iter.Key(), seen, depth+1) {
+			// key-reachable cycle missed here is not merely undetected — it
+			// exhausts the stack and kills the process, which recover() cannot
+			// catch. Reproduced exactly that way before keys were walked.
+			if inspect(iter.Key(), path, dirty) {
 				return true
 			}
-			if hasCycle(iter.Value(), seen, depth+1) {
+			if inspect(iter.Value(), path, dirty) {
 				return true
 			}
 		}
@@ -494,7 +535,7 @@ func hasCycle(v reflect.Value, seen map[nodeID]bool, depth int) bool {
 			return false
 		}
 		for i := 0; i < v.Len(); i++ {
-			if hasCycle(v.Index(i), seen, depth+1) {
+			if inspect(v.Index(i), path, dirty) {
 				return true
 			}
 		}
@@ -504,15 +545,16 @@ func hasCycle(v reflect.Value, seen map[nodeID]bool, depth int) bool {
 		t := v.Type()
 		for i := 0; i < t.NumField(); i++ {
 			if t.Field(i).PkgPath != "" {
-				continue
+				continue // unexported; unreachable by reflection, so unchangeable
 			}
-			if hasCycle(v.Field(i), seen, depth+1) {
+			if inspect(v.Field(i), path, dirty) {
 				return true
 			}
 		}
 		return false
 
 	default:
+		// Numbers, bools, funcs, channels: nothing to clean, nothing to loop.
 		return false
 	}
 }

@@ -95,17 +95,18 @@ func BenchmarkSanitizeString(b *testing.B) {
 // also names no internal function, so merging or renaming the walks cannot break
 // this test.
 //
-// The floor is not zero, and it is not 6 either. Sanitize makes TWO passes over
-// a clean payload — the cycle guard, then needsCleaning — and each independently
-// pays 6 allocations per row of reflect map-iteration boxing. Measured
-// separately, hasCycle, needsCleaning and sanitizeValue's own walk all cost
-// exactly 6.0 per row on the same fixture, so 12.0 is the floor for a two-walk
-// design and the only route below it is merging the walks.
+// The floor is not zero. Sanitize walks a clean payload once, via inspect, and
+// that single traversal costs 6.0 allocations per row of reflect map-iteration
+// boxing — a cost any reflective walk of a map[string]any pays, not overhead this
+// package adds. So 6.0 is the floor and 31.0 was the starting point.
 //
-// This ceiling was first written as 10.0, from counting one walk instead of two.
-// The measured numbers are 31.0 per row before the fix and 12.0 after, so the
-// copy is entirely gone; 15.0 leaves headroom above the floor without letting a
-// reinstated copy pass, which would show up at 31.0.
+// Two earlier versions of this bound were wrong, both recorded because the
+// mistakes are instructive. The first was an absolute 10.0 per row, from counting
+// one walk when there were two — the cycle guard and the dirtiness check ran
+// separately then, 6.0 each, so the real floor was 12.0. The second was absolute
+// at all, which three reviewers flagged: AllocsPerRun counts are a runtime
+// implementation detail, so a toolchain that changes how MapRange allocates fails
+// the suite with no code change. Hence the ratio below.
 func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 	clean := allocationsPerRow(t, false)
 	dirty := allocationsPerRow(t, true)
@@ -116,11 +117,17 @@ func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 	// MapRange allocates moves both together and the ratio holds, where an
 	// absolute ceiling would fail the suite with no code change at all.
 	//
-	// Measured 12.0 clean against 22.0 dirty, a ratio of 0.55. Reinstating the
-	// unconditional copy puts clean at 31.0 against roughly 32.0 dirty — a ratio
-	// near 0.97, because then both paths rebuild everything and the clean case
-	// has nothing left to save. 0.75 separates those cleanly.
-	const maxShare = 0.75
+	// Reinstating the unconditional copy puts clean at 31.0 against roughly 32.0
+	// dirty — a ratio near 0.97, because then both paths rebuild everything and
+	// the clean case has nothing left to save.
+	//
+	// The bound is tighter than that, because it also pins the number of WALKS a
+	// clean payload pays for. Two separate traversals of the same value — a cycle
+	// guard and then a dirtiness check — measured 12.0 against 22.0 dirty, a
+	// ratio of 0.55. One traversal answering both questions measures about 6.0,
+	// a ratio near 0.27. At 0.40 this fails if either the copy comes back or the
+	// walks split apart again.
+	const maxShare = 0.40
 
 	if share := clean / dirty; share > maxShare {
 		t.Errorf("a clean payload costs %.2f of what a dirty one costs (%.1f vs %.1f allocations "+
@@ -174,20 +181,34 @@ func allocationsPerRow(t *testing.T, dirty bool) float64 {
 // exits at the first string that needs work.
 //
 // Measured 32.0 per row before any of this, 54.0 with the discarding version,
-// 22.0 now. Expressed against the CLEAN path from the same run rather than as a
+// 23.0 now. Expressed against the CLEAN path from the same run rather than as a
 // fixed ceiling, for the reason given on the clean test: both figures move
-// together under a toolchain change, so the ratio survives one and an absolute
+// together under a toolchain change, so a ratio survives one where an absolute
 // number does not.
 //
-// Dirty is 22.0 against 12.0 clean, a ratio of 1.8. The discarding version was
-// 54.0 against 12.0, a ratio of 4.5, so 3.0 separates them. This guards the
-// DOUBLE BUILD specifically, not the copy — the clean test above is what
-// requires the copy to be skipped at all.
+// The bound has been recalibrated ONCE, and the reason matters more than the
+// number. It was 3.0, set when dirty measured 22.0 against 12.0 clean — a ratio
+// of 1.8 — with the discarding version at 54.0/12.0, a ratio of 4.5. Merging the
+// cycle and dirtiness walks then halved the clean path to 6.0. Dirty did not move
+// (22.0 to 23.0, noise), but the ratio jumped to 3.8 purely because the
+// DENOMINATOR improved, and this test failed while the thing it guards was fine.
+//
+// That is the exact flaw a reviewer found in output_test.go's guard-cost
+// assertion — a ratio firing when its denominator gets better — reintroduced here
+// while fixing it there. Recorded rather than quietly patched, because the shape
+// of the assertion is the lesson: dividing by a number you are actively trying to
+// reduce will keep doing this.
+//
+// The separation is still wide. Reintroducing the discarding detection today
+// leaves clean at 6.0, since the merged walk handles that, and puts dirty near
+// 54.0 — a ratio of 9.0 against 3.8 now. 6.0 sits between them with room on both
+// sides. This guards the DOUBLE BUILD specifically, not the copy; the clean test
+// above is what requires the copy to be skipped at all.
 func TestSanitize_DirtyPayloadDoesNotPayTwice(t *testing.T) {
 	clean := allocationsPerRow(t, false)
 	dirty := allocationsPerRow(t, true)
 
-	const maxRatio = 3.0
+	const maxRatio = 6.0
 
 	if ratio := dirty / clean; ratio > maxRatio {
 		t.Errorf("a payload needing cleaning costs %.1fx a clean one (%.1f vs %.1f allocations "+

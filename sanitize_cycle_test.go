@@ -152,22 +152,27 @@ func TestSanitize_SliceReachedTwiceIsNotACycle(t *testing.T) {
 // A cyclic value that ALSO carries a lossy type must still be refused as a
 // cycle.
 //
-// This guards one specific way of merging the two read-only walks. hasCycle and
-// lossyInValue traverse identical edges, so folding them into a single pass is
-// the obvious saving — but a merged walk that RETURNS EARLY on the lossy finding
-// never reaches the cycle. Sanitize would then see no cycle, proceed into
-// sanitizeValue, which has neither a seen-set nor a depth limit, and exhaust the
-// stack. That is a fatal runtime error rather than a panic: recover() cannot
-// catch it, so the process dies with a goroutine dump instead of returning an
-// error to the caller.
+// This is a live guard, not a hypothetical one. inspect answers the cycle
+// question and the dirtiness question in a single traversal, which is where the
+// hazard lives: a merged walk that RETURNS EARLY once it knows the value is
+// dirty never reaches a cycle further along. Sanitize would then see no cycle,
+// proceed into sanitizeValue — which has neither a seen-set nor a depth limit —
+// and exhaust the stack. That is a fatal runtime error rather than a panic:
+// recover() cannot catch it, so the process dies with a goroutine dump instead
+// of returning an error to the caller.
 //
-// A merged walk must therefore record the first lossy reason and KEEP WALKING,
-// and the cycle answer must win. This passes today because Sanitize runs the
-// cycle guard before any lossy walk exists on the path; it is here so that stays
-// true.
+// So inspect never short-circuits on dirtiness. It records the answer through a
+// pointer and keeps walking every edge; only a CYCLE may return early, because
+// Sanitize refuses the value outright in that case. This test is what keeps that
+// rule honest.
 //
-// If this test ever crashes the suite instead of failing, a merged walk is
-// short-circuiting on the lossy branch.
+// The value here carries a lossy type as well, so it also covers the separate
+// walk: lossyInValue stays independent of inspect because the two need opposite
+// seen-set policies — popped for cycle detection, kept for memoization — and
+// merging those would break one of them.
+//
+// If this test ever crashes the suite instead of failing, a walk is
+// short-circuiting before it has finished looking for cycles.
 func TestSanitize_CyclicValueCarryingALossyTypeIsRefusedAsACycle(t *testing.T) {
 	type node struct {
 		M    textMarshaler `toon:"m"`

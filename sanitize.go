@@ -115,28 +115,34 @@ func Sanitize(v any) (any, error) {
 		return nil, nil
 	}
 	rv := reflect.ValueOf(v)
-	// Refuse before walking, not during. sanitizeValue follows pointers with no
-	// seen-set, so a cycle never reaches the error return — it exhausts the
-	// stack and kills the process. This reuses the detector Check uses, so the
-	// two entry points cannot disagree about what counts as a cycle.
-	if hasCycle(rv, map[nodeID]bool{}, 0) {
+
+	// ONE walk, TWO answers.
+	//
+	// Refusing a cycle has to happen before any rebuild begins: sanitizeValue
+	// follows pointers with no seen-set, so a cycle never reaches its error
+	// return — it exhausts the stack and kills the process, and recover() cannot
+	// catch that. The dirtiness answer rides along for free, because deciding it
+	// needs exactly the same traversal over exactly the same edges.
+	//
+	// Running them as two passes cost 12 allocations per row on a clean listing
+	// where one pass costs 6, and left separate walkers whose edge sets had to
+	// stay in lockstep by convention alone.
+	//
+	// Gating at the ROOT rather than at every container is what keeps this
+	// linear. A per-container gate re-scanned each subtree at every level, so a
+	// payload dirty only at the bottom cost O(n × depth): 3.97 SECONDS for a value
+	// nested 10,000 deep, which is exactly the depth encoding/json accepts before
+	// rejecting at 10,001. It also made ONE hostile byte 23x more expensive than a
+	// payload dirty at every level, because dirt near the top lets each gate exit
+	// early while dirt at the bottom makes every gate scan the whole way down. One
+	// scan at the root is 14ms for that same input, and cheaper on ordinary
+	// payloads too — a fully dirty 500-row listing went from 27,033 allocations to
+	// 11,017.
+	var dirty bool
+	if inspect(rv, map[nodeID]bool{}, &dirty) {
 		return nil, &CycleError{Type: typeName(reflect.TypeOf(v))}
 	}
-	// The gate, once, at the root. One O(n) scan answers whether anything needs
-	// cleaning at all; if nothing does, v is returned untouched and this call
-	// allocates nothing.
-	//
-	// Gating HERE rather than at every container is what keeps the walk linear.
-	// A per-container gate re-scanned each subtree at every level, so a payload
-	// dirty only at the bottom cost O(n × depth): 3.97 SECONDS for a value nested
-	// 10,000 deep, which is exactly the depth encoding/json accepts before it
-	// rejects at 10,001. It also made ONE hostile byte 23x more expensive than a
-	// payload dirty at every level, because dirt near the top lets each gate exit
-	// early while dirt at the bottom makes every gate scan the whole way down.
-	// One scan at the root is 14ms for that same input, and cheaper on ordinary
-	// payloads too — a fully dirty 500-row listing went from 27,033 allocations
-	// to 11,017, which is also 31% below what it cost before any of this work.
-	if !needsCleaning(rv) {
+	if !dirty {
 		return v, nil
 	}
 	out, _, err := sanitizeValue(rv)
@@ -168,87 +174,24 @@ func SanitizeString(s string) string {
 	return cleanString(s)
 }
 
-// needsCleaning reports whether any string at or below v would change, without
-// building anything.
+// needsCleaning reports whether any string at or below v would change.
 //
-// It is called ONCE, from Sanitize, on the whole value. That placement is the
-// point: it makes the scan O(n). Calling it per container instead — which an
-// earlier version did, to pass clean subtrees through untouched — re-scanned
-// every subtree at every level and turned the walk quadratic, 3.97 seconds for a
-// payload nested 10,000 deep against 14ms for one scan at the root. Sanitize's
-// comment carries the full numbers.
+// A thin wrapper over inspect, which answers this and the cycle question in one
+// traversal. Production code does not call it — Sanitize takes both answers from
+// inspect directly rather than walking the value twice.
 //
-// It exists because the other way to answer the same question — recursing
-// sanitizeValue and discarding the result when nothing changed — allocates the
-// very copies it throws away, 48 wasted allocations per row on a dirty payload.
-// This predicate allocates nothing of its own and exits at the first string
-// needing work, so it costs the same whatever the payload size.
-//
-// On a CLEAN payload it measures 6 allocations per row, identical to hasCycle.
-// That figure is the reflect map-iteration boxing any walk of a map[string]any
-// must pay; it is the floor, not overhead this adds.
-//
-// No seen set is needed. It runs only after hasCycle has refused every cycle, so
-// the value is acyclic by the time it is reached — Sanitize calls the guard four
-// lines above, and there is no other caller.
+// It stays because the agreement between this predicate and sanitizeValue is the
+// load-bearing invariant of the whole copy-on-write scheme: if it ever answers
+// "no" for a value sanitizing WOULD have changed, a control byte reaches output
+// and this package has failed at its one job. Naming it keeps that property
+// testable on its own, rather than only through its effect on Sanitize. See
+// TestSanitize_PredicateAgreesWithTheWalk.
+// The cycle result is discarded deliberately: every value reaching this in a test
+// is acyclic, and a cyclic one is Sanitize's problem rather than the predicate's.
 func needsCleaning(v reflect.Value) bool {
-	if !v.IsValid() {
-		return false
-	}
-
-	switch v.Kind() {
-	case reflect.String:
-		// cleanString returns its argument unchanged when there is nothing to
-		// strip, so this comparison is a pointer check in the common case.
-		s := v.String()
-		return cleanString(s) != s
-
-	case reflect.Interface, reflect.Pointer:
-		if v.IsNil() {
-			return false
-		}
-		return needsCleaning(v.Elem())
-
-	case reflect.Struct:
-		t := v.Type()
-		for i := 0; i < t.NumField(); i++ {
-			if t.Field(i).PkgPath != "" {
-				continue // unexported; unreachable by reflection, so unchangeable
-			}
-			if needsCleaning(v.Field(i)) {
-				return true
-			}
-		}
-		return false
-
-	case reflect.Map:
-		if v.IsNil() {
-			return false
-		}
-		for iter := v.MapRange(); iter.Next(); {
-			// Keys count. A key is a field name in tabular output, so a control
-			// byte there lands in the header rather than in a cell.
-			if needsCleaning(iter.Key()) || needsCleaning(iter.Value()) {
-				return true
-			}
-		}
-		return false
-
-	case reflect.Slice, reflect.Array:
-		if v.Kind() == reflect.Slice && v.IsNil() {
-			return false
-		}
-		for i := 0; i < v.Len(); i++ {
-			if needsCleaning(v.Index(i)) {
-				return true
-			}
-		}
-		return false
-
-	default:
-		// Numbers, bools, funcs, channels: nothing to clean.
-		return false
-	}
+	var dirty bool
+	inspect(v, map[nodeID]bool{}, &dirty)
+	return dirty
 }
 
 // sanitizeValue walks v and returns a cleaned value of the same type, plus
