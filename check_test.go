@@ -82,10 +82,10 @@ func TestCheck_FindsTextMarshalerAtAnyDepth(t *testing.T) {
 	}
 }
 
-// "AtAnyDepth" above overpromises. lossyInValue gives up at maxWalkDepth and
-// returns "", which MEANS "no loss found" — so past the cap the guard reports a
-// clean bill of health for a payload whose value toon-go drops. Probed against
-// the pinned version, the boundary is exact:
+// "AtAnyDepth" above used to overpromise. lossyInValue bounded itself with a
+// depth cap and returned "" at depth 100 — and "" MEANS "no loss found", so past
+// the cap the guard gave a clean bill of health to a payload whose value toon-go
+// drops. Probed against the pinned version, the boundary was exact:
 //
 //	layers of []any   Check.OK   value walk found it
 //	49                false      true
@@ -120,6 +120,50 @@ func TestCheck_FindsALossyTypeBelowTheOldDepthCap(t *testing.T) {
 				layers, got.Tier)
 		}
 	}
+}
+
+// The depth cap was replaced by a seen set keyed on node identity, and that
+// swap has two ways to go wrong in opposite directions. Both are covered here
+// because neither is visible in the percentage: the walk can INVENT loss by
+// mis-keying unrelated nodes together, or HIDE loss by skipping a node before
+// its subtree was fully explored.
+//
+// Memoizing is sound only because a repeat visit means the identical subtree:
+// the entry is written after the node is entered and never removed, so a "" for
+// a seen node is a result already computed, not a guess. Type keying would not
+// be sound, and was the bug that shipped once — see lossyInValue's comment.
+func TestCheck_NodeMemoizationNeitherHidesNorInventsLoss(t *testing.T) {
+	// A shared slice exercises the slice memoization hit; the nil map and nil
+	// pointer exercise the nil guard in the identity-tracking switch. A nil
+	// *textMarshaler would NOT reach that guard — a value-receiver method set
+	// belongs to the pointer type too, so isLossyType flags it first.
+	t.Run("shared and nil nodes are not reported lossy", func(t *testing.T) {
+		shared := []any{"a", "b"}
+		var nilMap map[string]any
+		var nilPtr *struct {
+			X string `toon:"x"`
+		}
+		got := Check(map[string]any{
+			"first":  shared,
+			"second": shared,
+			"absent": nilMap,
+			"gone":   nilPtr,
+		})
+		if !got.OK {
+			t.Errorf("shared and nil nodes must not be reported lossy, got %q", got.Reason)
+		}
+	})
+
+	// The direction that matters. If the walk ever marked a node seen BEFORE
+	// exploring it, or reused a "" from a partial visit, the loss inside a
+	// twice-reached node would vanish silently.
+	t.Run("a lossy type inside a twice-reached node is still found", func(t *testing.T) {
+		shared := []any{textMarshaler{v: "SECRET"}}
+		got := Check(map[string]any{"first": shared, "second": shared})
+		if got.OK {
+			t.Error("memoizing a repeated node must not skip the loss inside it")
+		}
+	})
 }
 
 // A defined string type fails loudly rather than silently, but it still cannot

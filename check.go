@@ -85,11 +85,6 @@ var textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 // exclusion Check rejects every payload carrying a timestamp.
 var timeType = reflect.TypeOf(time.Time{})
 
-// maxWalkDepth bounds the lossy VALUE walk, which has no seen set of its own.
-// The cycle guard does not use it: hasCycle terminates on identity, and a depth
-// cap there would silently pass a cycle through to the encoder.
-const maxWalkDepth = 100
-
 // isLossyType reports whether toon-go drops values of this type.
 //
 // Only t's own method set is consulted. Checking reflect.PointerTo(t) as well
@@ -176,7 +171,7 @@ func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	if reason := lossyInType(reflect.TypeOf(v), map[reflect.Type]bool{}); reason != "" {
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
-	if reason := lossyInValue(reflect.ValueOf(v), 0); reason != "" {
+	if reason := lossyInValue(reflect.ValueOf(v), map[nodeID]bool{}); reason != "" {
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
 
@@ -295,14 +290,61 @@ func lossyInType(t reflect.Type, seen map[reflect.Type]bool) string {
 // walk had already marked, so every dynamic element was skipped and a
 // TextMarshaler inside a slice or map went undetected.
 //
-// Cycles are bounded by depth instead, since a value cycle cannot be detected by
-// type identity.
-func lossyInValue(v reflect.Value, depth int) string {
-	if !v.IsValid() || depth > maxWalkDepth {
+// It DOES memoize by NODE IDENTITY, which is sound where type keying was not. A
+// pointer, map or slice node is the same subtree every time it is reached, so if
+// the first full visit found no loss, no later visit can. That is what
+// terminates the walk.
+//
+// Termination used to be a depth cap, and the cap was a hole. It returned "" at
+// depth 100, and "" MEANS "no loss found" — so a TextMarshaler nested deeper was
+// reported clean while toon-go dropped its value and still emitted its key.
+// Probed against the pinned version, the boundary was exact: 49 layers of []any
+// were caught, 50 were not, nor 200, nor 1000.
+//
+// The cap could not simply be deleted. CheckSanitized is public and runs this
+// walk on a RAW value with no cycle pre-check of its own, so a self-referential
+// argument would recurse until the stack died — a fatal runtime error rather
+// than a panic, which recover() cannot catch. The seen set replaces the cap
+// without leaving that hole: termination no longer depends on how deep the value
+// is, only on whether a node repeats.
+func lossyInValue(v reflect.Value, seen map[nodeID]bool) string {
+	if !v.IsValid() {
 		return ""
 	}
 	if isLossyType(v.Type()) {
 		return lossyReason(v.Type())
+	}
+
+	// Identity is tracked for the three reference-bearing kinds, matching
+	// hasCycle so the two walks cannot disagree about which edges repeat.
+	//
+	// Unlike hasCycle the entry is NOT removed on the way back out. hasCycle asks
+	// "is this node on my current path", which needs the pop; this walk asks "is
+	// there a loss anywhere below", and a node already proven clean stays clean
+	// however it is reached again.
+	switch v.Kind() {
+	case reflect.Map, reflect.Pointer:
+		if v.IsNil() {
+			return ""
+		}
+		id := nodeID{ptr: v.Pointer()}
+		if seen[id] {
+			return ""
+		}
+		seen[id] = true
+
+	case reflect.Slice:
+		// An empty slice is not tracked. Zero-length allocations share one
+		// address (runtime.zerobase), so tracking them would collide unrelated
+		// slices — and a slice with no elements has nothing below it anyway.
+		if v.IsNil() || v.Len() == 0 {
+			break
+		}
+		id := nodeID{ptr: v.Pointer(), len: v.Len()}
+		if seen[id] {
+			return ""
+		}
+		seen[id] = true
 	}
 
 	switch v.Kind() {
@@ -310,7 +352,7 @@ func lossyInValue(v reflect.Value, depth int) string {
 		if v.IsNil() {
 			return ""
 		}
-		return lossyInValue(v.Elem(), depth+1)
+		return lossyInValue(v.Elem(), seen)
 
 	case reflect.Struct:
 		t := v.Type()
@@ -318,7 +360,7 @@ func lossyInValue(v reflect.Value, depth int) string {
 			if t.Field(i).PkgPath != "" {
 				continue
 			}
-			if reason := lossyInValue(v.Field(i), depth+1); reason != "" {
+			if reason := lossyInValue(v.Field(i), seen); reason != "" {
 				return reason
 			}
 		}
@@ -330,10 +372,10 @@ func lossyInValue(v reflect.Value, depth int) string {
 		}
 		iter := v.MapRange()
 		for iter.Next() {
-			if reason := lossyInValue(iter.Key(), depth+1); reason != "" {
+			if reason := lossyInValue(iter.Key(), seen); reason != "" {
 				return reason
 			}
-			if reason := lossyInValue(iter.Value(), depth+1); reason != "" {
+			if reason := lossyInValue(iter.Value(), seen); reason != "" {
 				return reason
 			}
 		}
@@ -344,7 +386,7 @@ func lossyInValue(v reflect.Value, depth int) string {
 			return ""
 		}
 		for i := 0; i < v.Len(); i++ {
-			if reason := lossyInValue(v.Index(i), depth+1); reason != "" {
+			if reason := lossyInValue(v.Index(i), seen); reason != "" {
 				return reason
 			}
 		}
