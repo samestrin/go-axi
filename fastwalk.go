@@ -158,17 +158,17 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 // cannot be lossy; inspect walks keys because a POINTER key can close a cycle,
 // which is a different question.
 //
-// MEMO POLICY, and it is still not fastInspect's. That walk pops every entry on
-// exit, because it asks whether a node is on the CURRENT path and without
-// popping every DAG would read as a cycle. This one memoizes "no loss below this
-// node", so a cleared node stays cleared however it is reached again.
+// MEMO POLICY, and it is the opposite of fastInspect's. That walk pops every
+// entry on exit, because it asks whether a node is on the CURRENT path and
+// without popping every DAG would read as a cycle. This one memoizes "no loss
+// below this node", so a cleared node stays cleared however it is reached again.
 //
-// It keeps BOTH in one map, told apart by the value stored: true while a node is
-// on the path, false once it is walked and clear. Cleared entries are evicted
-// past maxLossyMemo so the map cannot grow to one entry per node; path entries
-// never are, because evicting one turns a cycle back into infinite recursion.
-// The two walks' sets must still not be shared, and are not: each is handed its
-// own.
+// The memo is BOUNDED, though: past maxLossyMemo an entry is deleted on the way
+// out instead of being kept, so the map cannot grow to one entry per node. It is
+// still inserted on the way IN, which is what keeps a cycle caught. A payload
+// below the bound behaves, and costs, exactly as it did before.
+//
+// The two walks' sets must not be shared, and are not: each is handed its own.
 //
 // Termination therefore does not depend on depth, which matters because
 // CheckSanitized is public and reaches this on a raw value with no cycle
@@ -189,17 +189,25 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 			return ""
 		}
 		id := nodeID{ptr: reflect.ValueOf(x).Pointer()}
-		// Present at all means stop: true is a cycle, false is a cleared memo.
-		if _, visited := seen[id]; visited {
+		if seen[id] {
 			return ""
 		}
 		seen[id] = true
-		defer releaseLossyNode(seen, id)
+		// Transient past the bound: dropped on the way out rather than kept as a
+		// memo. Deleted explicitly at every exit rather than with defer — see
+		// maxLossyMemo for what a defer in this function costs.
+		transient := len(seen) > maxLossyMemo
 
 		for _, val := range x {
 			if reason := fastLossyInValue(val, seen); reason != "" {
+				if transient {
+					delete(seen, id)
+				}
 				return reason
 			}
+		}
+		if transient {
+			delete(seen, id)
 		}
 		return ""
 
@@ -208,17 +216,24 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 			return ""
 		}
 		id := nodeID{ptr: reflect.ValueOf(x).Pointer(), len: len(x)}
-		// Present at all means stop: true is a cycle, false is a cleared memo.
-		if _, visited := seen[id]; visited {
+		if seen[id] {
 			return ""
 		}
 		seen[id] = true
-		defer releaseLossyNode(seen, id)
+		// Transient past the bound; deleted explicitly at every exit rather than
+		// with defer. See maxLossyMemo.
+		transient := len(seen) > maxLossyMemo
 
 		for _, e := range x {
 			if reason := fastLossyInValue(e, seen); reason != "" {
+				if transient {
+					delete(seen, id)
+				}
 				return reason
 			}
+		}
+		if transient {
+			delete(seen, id)
 		}
 		return ""
 

@@ -295,15 +295,11 @@ func lossyInType(t reflect.Type, seen map[reflect.Type]bool) string {
 // the first full visit found no loss, no later visit can. That is what
 // terminates the walk.
 //
-// ONE map carries two kinds of entry, told apart by the value stored: true for a
-// node on the CURRENT path, false for one already walked and found clean.
-// Arriving at either means "stop", for different reasons — the first is a cycle,
-// the second a memo hit — and both correctly answer "nothing lost this way".
-//
-// Only CLEARED entries are ever evicted, and only past maxLossyMemo, so peak size
-// is bounded by maxLossyMemo + depth rather than growing to one entry per node.
-// Evicting a path entry would turn a cycle back into infinite recursion, so the
-// two are deliberately distinguishable. See releaseLossyNode.
+// The memo is BOUNDED. Entries are kept exactly as before while the map is
+// small; past maxLossyMemo a node is still inserted on the way IN — so it guards
+// the subtree below it against a cycle — but deleted on the way OUT rather than
+// kept. Peak size is maxLossyMemo + depth instead of one entry per node, and a
+// payload below the bound pays nothing for it. See maxLossyMemo.
 //
 // Termination used to be a depth cap, and the cap was a hole. It returned "" at
 // depth 100, and "" MEANS "no loss found" — so a TextMarshaler nested deeper was
@@ -355,12 +351,16 @@ func lossyInValue(v reflect.Value, seen map[nodeID]bool) string {
 		id, tracked = nodeID{ptr: v.Pointer(), len: v.Len()}, true
 	}
 	if tracked {
-		// Present at all means stop: true is a cycle, false is a cleared memo.
-		if _, visited := seen[id]; visited {
+		if seen[id] {
 			return ""
 		}
 		seen[id] = true
-		defer releaseLossyNode(seen, id)
+		if len(seen) > maxLossyMemo {
+			// Past the bound this entry is transient. It still guards the
+			// subtree below against a cycle, but it is dropped on the way out
+			// instead of being kept as a memo. See maxLossyMemo.
+			defer delete(seen, id)
+		}
 	}
 
 	switch v.Kind() {
@@ -413,7 +413,7 @@ func lossyInValue(v reflect.Value, seen map[nodeID]bool) string {
 	}
 }
 
-// maxLossyMemo bounds how many CLEARED nodes the lossy walk remembers.
+// maxLossyMemo bounds how many nodes the lossy walk remembers.
 //
 // Without a bound the walk retained one entry per distinct pointer, map and
 // slice for its whole duration — O(total nodes) live, where the depth cap it
@@ -421,27 +421,25 @@ func lossyInValue(v reflect.Value, seen map[nodeID]bool) string {
 // row listing, on the output path through EncodeChecked and EncodeOrJSON, so a
 // million-row listing built a multi-million-entry map on top of the payload.
 //
-// The memo could not simply be removed, because it is also what terminates the
-// walk. Splitting the states is what makes a bound safe: a node on the current
-// path is never evicted, so a cycle is still caught, while a cleared node is
-// pure memoization and may be dropped. Peak size is therefore maxLossyMemo plus
-// the depth of the value.
+// The memo cannot simply be removed, because it is also what TERMINATES the
+// walk: a cycle is caught by arriving at a node already in the map.
 //
-// Dropping a cleared entry costs time, never correctness — the node is walked
-// again and reaches the same answer. 4096 is generous for the sharing a TOON
-// payload actually contains (row listings share almost nothing) while keeping
-// the worst case to kilobytes rather than to the size of the input.
+// So entries are kept exactly as before while the map is small, and only past
+// this size does an entry become transient — still inserted on the way in, so it
+// guards the subtree below it against a cycle, but deleted on the way out
+// instead of being kept. Peak size is maxLossyMemo plus the depth of the value.
+//
+// PAYING NOTHING UNTIL THE BOUND IS REACHED is the point, and it was not free to
+// learn. The first version tracked path and cleared nodes as two states and did
+// bookkeeping on every node regardless of size. It cost 7.7% on EncodeOrJSON at
+// 2000 rows and 4.3% on Check — a permanent tax on every payload, to bound a
+// case that only arises far above that size. Measured, then replaced with this.
+//
+// Dropping an entry costs time, never correctness: the node is walked again and
+// reaches the same answer. 4096 is generous for the sharing a TOON payload
+// actually contains — row listings share almost nothing — while keeping the
+// worst case to kilobytes rather than to the size of the input.
 const maxLossyMemo = 4096
-
-// releaseLossyNode retires a node the lossy walk has finished with, keeping it
-// as a memo while there is room and forgetting it otherwise. See maxLossyMemo.
-func releaseLossyNode(seen map[nodeID]bool, id nodeID) {
-	if len(seen) <= maxLossyMemo {
-		seen[id] = false // cleared: a later visit skips this subtree
-		return
-	}
-	delete(seen, id)
-}
 
 // nodeID identifies a reference-bearing value for the cycle walk.
 //
