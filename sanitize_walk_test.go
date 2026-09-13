@@ -280,6 +280,21 @@ func TestSanitize_PredicateAgreesWithTheWalk(t *testing.T) {
 		Arr [2]string `toon:"arr"`
 	}
 
+	// A map with a NON-STRING key is deliberately absent from this table, and
+	// adding one will fail the strict comparison below. That is expected rather
+	// than a bug, so it is written down here where someone extending the table
+	// will read it.
+	//
+	// sanitizeValue re-keys a string key only. For any other key kind it walks the
+	// key but keeps the caller's original, because a rebuilt pointer key is an
+	// address the caller cannot construct and the entry becomes unreachable. So
+	// for map[*T]V holding a dirty pointee, inspect reports dirty while the result
+	// is DeepEqual-identical to the input: predicate true, changed false.
+	//
+	// That divergence is in the SAFE direction. This test exists to catch the
+	// opposite one — predicate false for a value that DID change, which lets a
+	// control byte reach output. Over-reporting only costs a rebuild nobody needed.
+	// See TestSanitize_PointerMapKeyStaysTheCallersKey for the rule itself.
 	shapes := []struct {
 		name string
 		in   any

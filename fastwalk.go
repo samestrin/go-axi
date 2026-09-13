@@ -158,12 +158,17 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 // cannot be lossy; inspect walks keys because a POINTER key can close a cycle,
 // which is a different question.
 //
-// MEMO POLICY, and it is the opposite of fastInspect's. Entries are KEPT, never
-// popped, because this walk memoizes "no loss below this node" — a node already
-// cleared stays cleared however it is reached again. fastInspect pops, because
-// it asks whether a node is on the CURRENT path and without popping every DAG
-// would read as a cycle. The two sets must not be shared, and are not: each walk
-// is handed its own.
+// MEMO POLICY, and it is the opposite of fastInspect's. That walk pops every
+// entry on exit, because it asks whether a node is on the CURRENT path and
+// without popping every DAG would read as a cycle. This one memoizes "no loss
+// below this node", so a cleared node stays cleared however it is reached again.
+//
+// The memo is BOUNDED, though: past maxLossyMemo an entry is deleted on the way
+// out instead of being kept, so the map cannot grow to one entry per node. It is
+// still inserted on the way IN, which is what keeps a cycle caught. A payload
+// below the bound behaves, and costs, exactly as it did before.
+//
+// The two walks' sets must not be shared, and are not: each is handed its own.
 //
 // Termination therefore does not depend on depth, which matters because
 // CheckSanitized is public and reaches this on a raw value with no cycle
@@ -188,11 +193,21 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 			return ""
 		}
 		seen[id] = true
+		// Transient past the bound: dropped on the way out rather than kept as a
+		// memo. Deleted explicitly at every exit rather than with defer — see
+		// maxLossyMemo for what a defer in this function costs.
+		transient := len(seen) > maxLossyMemo
 
 		for _, val := range x {
 			if reason := fastLossyInValue(val, seen); reason != "" {
+				if transient {
+					delete(seen, id)
+				}
 				return reason
 			}
+		}
+		if transient {
+			delete(seen, id)
 		}
 		return ""
 
@@ -205,11 +220,20 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 			return ""
 		}
 		seen[id] = true
+		// Transient past the bound; deleted explicitly at every exit rather than
+		// with defer. See maxLossyMemo.
+		transient := len(seen) > maxLossyMemo
 
 		for _, e := range x {
 			if reason := fastLossyInValue(e, seen); reason != "" {
+				if transient {
+					delete(seen, id)
+				}
 				return reason
 			}
+		}
+		if transient {
+			delete(seen, id)
 		}
 		return ""
 

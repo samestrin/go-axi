@@ -337,9 +337,30 @@ func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 		out := reflect.MakeMapWithSize(v.Type(), v.Len())
 		seen := make(map[any]any, v.Len())
 		for iter := v.MapRange(); iter.Next(); {
-			key, _, err := sanitizeValue(iter.Key())
+			key, keyChanged, err := sanitizeValue(iter.Key())
 			if err != nil {
 				return reflect.Value{}, false, err
+			}
+			// Re-key ONLY a string-kinded key. Every other kind is compared by
+			// identity or rebuilt wholesale, so a cleaned key is an object the
+			// caller never had: a pointer key whose pointee held a dirty string
+			// was reallocated, and the entry became unreachable — not by the
+			// original key, and not by a cleaned one either, because the caller
+			// cannot construct the new address.
+			//
+			// Nothing is given up by declining. toon-go accepts plain builtin
+			// key types only, so a string key is the ONLY key that can reach
+			// output at all. Measured through Check: map[string]string is OK,
+			// while map[*T]string, map[any]string and a struct-keyed map are
+			// each refused with "unsupported map key type". Re-keying a
+			// non-string key therefore cannot enable output — it can only cost
+			// the caller the lookup.
+			//
+			// The key is still WALKED above; only its rebuilt result is dropped.
+			// That walk is what propagates an error from inside the key, which
+			// TestSanitize_CollisionInMapKeyPropagates depends on.
+			if keyChanged && iter.Key().Kind() != reflect.String {
+				key = iter.Key()
 			}
 			val, _, err := sanitizeValue(iter.Value())
 			if err != nil {
