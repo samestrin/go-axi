@@ -155,6 +155,46 @@ func allocationsPerRow(t *testing.T, dirty bool) float64 {
 	return (measure(large) - measure(small)) / float64(large-small)
 }
 
+// deepCopyPayload rebuilds a payload by hand: no reflection, no cleaning, no
+// guards. It is the yardstick the dirty-path assertion below measures against —
+// the cost of exactly one rebuild of this shape, and nothing else.
+func deepCopyPayload(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = deepCopyPayload(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = deepCopyPayload(e)
+		}
+		return out
+	default:
+		return x
+	}
+}
+
+// deepCopyAllocationsPerRow is allocationsPerRow's yardstick twin, measured the
+// same way over the same fixture so the two are directly comparable.
+func deepCopyAllocationsPerRow(t *testing.T) float64 {
+	t.Helper()
+
+	const (
+		small = 20
+		large = 500
+	)
+
+	measure := func(n int) float64 {
+		v := benchRows(n, true)
+		return testing.AllocsPerRun(50, func() { _ = deepCopyPayload(v) })
+	}
+
+	return (measure(large) - measure(small)) / float64(large-small)
+}
+
 // Making the clean path cheap must not be paid for by the dirty path.
 //
 // The first attempt at skipping the copy decided whether a container had changed
@@ -162,44 +202,42 @@ func allocationsPerRow(t *testing.T, dirty bool) float64 {
 // the whole rebuild twice: a fully dirty payload went from 32.0 to 54.0
 // allocations per row, 1.69x worse than before the optimization existed, and it
 // was not a cold path either — one dirty string makes every ancestor container
-// dirty. needsCleaning answers the same question without building anything and
-// exits at the first string that needs work.
+// dirty.
 //
-// Measured 32.0 per row before any of this, 54.0 with the discarding version,
-// 23.0 now. Expressed against the CLEAN path from the same run rather than as a
-// fixed ceiling, for the reason given on the clean test: both figures move
-// together under a toolchain change, so a ratio survives one where an absolute
-// number does not.
+// WHAT THE DENOMINATOR MUST NOT BE: the clean path. This assertion was written
+// twice against it and broke twice, both times because the clean path got
+// FASTER. First the walk merge halved it and the ratio jumped from 1.8 to 3.8,
+// failing while the property held; the bound was recalibrated, which treated the
+// symptom. Then the reflect-free walk took the clean path to zero allocations
+// per row and the ratio became +Inf. An external reviewer filed that second
+// failure as a prediction before it happened, having already found the identical
+// flaw in output_test.go's guard-cost assertion. Dividing by a number you are
+// actively driving down will keep doing this.
 //
-// The bound has been recalibrated ONCE, and the reason matters more than the
-// number. It was 3.0, set when dirty measured 22.0 against 12.0 clean — a ratio
-// of 1.8 — with the discarding version at 54.0/12.0, a ratio of 4.5. Merging the
-// cycle and dirtiness walks then halved the clean path to 6.0. Dirty did not move
-// (22.0 to 23.0, noise), but the ratio jumped to 3.8 purely because the
-// DENOMINATOR improved, and this test failed while the thing it guards was fine.
+// So the denominator is now a hand-written deep copy of the same fixture,
+// measured in the same run. It moves WITH the rebuild rather than against it,
+// and it is immune to every optimisation applied to the walks: measured at 2.0
+// allocations per row under both the reflect walk and the reflect-free one.
 //
-// That is the exact flaw a reviewer found in output_test.go's guard-cost
-// assertion — a ratio firing when its denominator gets better — reintroduced here
-// while fixing it there. Recorded rather than quietly patched, because the shape
-// of the assertion is the lesson: dividing by a number you are actively trying to
-// reduce will keep doing this.
+// Against that yardstick: 11.0 with the reflect walk, 8.0 with the fast path,
+// and roughly 27.0 for the discarding double-build — that last figure is derived
+// rather than directly measured, from the recorded 54.0 per row against this
+// 2.0 reference. A bound of 16.0 clears both real implementations and still
+// fails the bug by a wide margin.
 //
-// The separation is still wide. Reintroducing the discarding detection today
-// leaves clean at 6.0, since the merged walk handles that, and puts dirty near
-// 54.0 — a ratio of 9.0 against 3.8 now. 6.0 sits between them with room on both
-// sides. This guards the DOUBLE BUILD specifically, not the copy; the clean test
-// above is what requires the copy to be skipped at all.
+// This guards the DOUBLE BUILD specifically, not the copy. The clean test above
+// is what requires the copy to be skipped at all.
 func TestSanitize_DirtyPayloadDoesNotPayTwice(t *testing.T) {
-	clean := allocationsPerRow(t, false)
 	dirty := allocationsPerRow(t, true)
+	rebuild := deepCopyAllocationsPerRow(t)
 
-	const maxRatio = 6.0
+	const maxRatio = 16.0
 
-	if ratio := dirty / clean; ratio > maxRatio {
-		t.Errorf("a payload needing cleaning costs %.1fx a clean one (%.1f vs %.1f allocations "+
-			"per row), want at most %.1fx. A cost this high means the rebuild is allocated "+
-			"twice — once to decide whether anything changed, once to build the result.",
-			ratio, dirty, clean, maxRatio)
+	if ratio := dirty / rebuild; ratio > maxRatio {
+		t.Errorf("sanitizing a dirty payload costs %.1fx one hand-written rebuild (%.1f vs %.1f "+
+			"allocations per row), want at most %.1fx. A cost this high means the rebuild is "+
+			"allocated twice — once to decide whether anything changed, once to build the result.",
+			ratio, dirty, rebuild, maxRatio)
 	}
 }
 
