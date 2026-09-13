@@ -52,6 +52,12 @@ func TestFastInspect_AgreesWithReflect(t *testing.T) {
 		{"nil slice", []any(nil)},
 		{"empty slice", []any{}},
 		{"clean string slice", []string{"a", "b"}},
+		{"empty string slice", []string{}},
+		{"nil string slice", []string(nil)},
+		{"shared string slice twice", func() any {
+			s := []string{"a", "b"}
+			return map[string]any{"x": s, "y": s}
+		}()},
 		{"unicode text", "naïve façade 🙂"},
 		{"genuine replacement char", "a\ufffdb"},
 		{"preserved whitespace", "a\nb\tc\rd"},

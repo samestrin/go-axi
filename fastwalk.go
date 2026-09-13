@@ -20,11 +20,19 @@ import "reflect"
 //
 // THE HAZARD, stated because it is real and was raised by three independent
 // reviewers before this existed: the package now contains two implementations of
-// one traversal, and they must agree forever. The edge set here has to match
-// inspect's exactly — the same reference-bearing kinds tracked by identity, the
-// same pop-on-exit so a DAG is not mistaken for a cycle, map KEYS walked as well
-// as values, and no short-circuit once dirtiness is known, because the walk must
-// still complete to be sure about cycles. That agreement is not left to
+// one traversal, and they must agree forever. What must match inspect exactly is
+// the set of ANSWERS, and the rules that produce them: every reference-bearing
+// kind tracked by identity with the same {ptr} or {ptr,len} key, the same
+// pop-on-exit so a DAG is not mistaken for a cycle, empty slices left untracked
+// because zero-length allocations share runtime.zerobase, map KEYS walked as
+// well as values, and no short-circuit once dirtiness is known, because the walk
+// must still complete to be sure about cycles.
+//
+// An earlier version of this comment claimed the edge sets matched exactly while
+// the []string arm tracked no identity at all. Review caught it. The arm now
+// tracks, so the claim holds — but the lesson is that a stated invariant nobody
+// checks is worth less than no claim, and this package's history is mostly bugs
+// of exactly that shape. That agreement is not left to
 // inspection: TestFastInspect_AgreesWithReflect asserts it over every shape,
 // and is the reason this is safe to keep.
 func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
@@ -96,8 +104,26 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 
 	case []string:
 		// Common enough to be worth its own arm — WriteHelp's input shape, and
-		// any list of plain values. Strings cannot hold a reference, so no
-		// identity tracking is needed.
+		// any list of plain values.
+		//
+		// Identity IS tracked here, even though a string cannot hold a reference
+		// and so a []string can never be its own ancestor, which makes the repeat
+		// branch below unreachable in practice. It is tracked because inspect
+		// tracks every non-empty slice by {ptr,len}, and this file claims the two
+		// edge sets match exactly. Review found that claim already false on
+		// arrival because this arm tracked nothing: harmless for cycles, but an
+		// invariant stated and not held is the failure mode this package keeps
+		// getting bitten by.
+		if len(x) == 0 {
+			return false
+		}
+		id := nodeID{ptr: reflect.ValueOf(x).Pointer(), len: len(x)}
+		if path[id] {
+			return true
+		}
+		path[id] = true
+		defer delete(path, id)
+
 		for _, s := range x {
 			if !*dirty && cleanString(s) != s {
 				*dirty = true
@@ -188,6 +214,16 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 		return ""
 
 	case []string:
+		// Deliberately NOT memoized, unlike lossyInValue's slice arm and unlike
+		// fastInspect's []string arm above. Both of those iterate; this one
+		// cannot find anything, because string does not implement TextMarshaler,
+		// so it answers in constant time without touching an element.
+		//
+		// A review finding claimed the opposite — that omitting the memo makes a
+		// shared []string rescanned once per reference. There is no scan to
+		// repeat: memoizing an O(1) arm would add a map write and a Pointer call
+		// to buy nothing. The arm the reflect walk uses here does iterate, so
+		// this is strictly cheaper than what it replaces.
 		return ""
 
 	default:

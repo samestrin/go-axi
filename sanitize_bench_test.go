@@ -225,11 +225,27 @@ func deepCopyAllocationsPerRow(t *testing.T) float64 {
 // and it is immune to every optimisation applied to the walks: measured at 2.0
 // allocations per row under both the reflect walk and the reflect-free one.
 //
-// Against that yardstick: 11.0 with the reflect walk, 8.0 with the fast path,
-// and roughly 27.0 for the discarding double-build — that last figure is derived
-// rather than directly measured, from the recorded 54.0 per row against this
-// 2.0 reference. A bound of 16.0 clears both real implementations and still
-// fails the bug by a wide margin.
+// Against that yardstick, and every figure here is MEASURED rather than derived:
+//
+//	as shipped, reflect-free walk     8.00
+//	as shipped, reflect walk         11.00
+//	a double build                   16.00   <- this must fail
+//
+// The bound was 16.0, and it was worthless. It came from arithmetic — a 54.0
+// per-row figure recorded under a different accounting, divided by this 2.0
+// yardstick — which put a double build at "roughly 27.0". A reviewer objected
+// that the anchor had never been measured. Measuring it put a double build at
+// exactly 16.00, which against a strictly-greater comparison means the guard
+// would have PASSED while the regression it exists to catch was present. The
+// estimate was wrong by 1.7x in the one direction that makes a test useless.
+//
+// The measured 16.00 is a conservative floor, not an estimate of the original
+// bug. It models the regression by running the full rebuild twice, whereas the
+// version that shipped did a partial detection pass per CONTAINER and measured
+// far worse. A bound that fails this model therefore fails anything worse too.
+//
+// 12.0 sits above both shipped implementations, tolerates either walk, and fails
+// a double build by 4.0.
 //
 // This guards the DOUBLE BUILD specifically, not the copy. The clean test above
 // is what requires the copy to be skipped at all.
@@ -237,7 +253,7 @@ func TestSanitize_DirtyPayloadDoesNotPayTwice(t *testing.T) {
 	dirty := allocationsPerRow(t, true)
 	rebuild := deepCopyAllocationsPerRow(t)
 
-	const maxRatio = 16.0
+	const maxRatio = 12.0
 
 	if ratio := dirty / rebuild; ratio > maxRatio {
 		t.Errorf("sanitizing a dirty payload costs %.1fx one hand-written rebuild (%.1f vs %.1f "+

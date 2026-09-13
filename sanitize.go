@@ -127,8 +127,10 @@ func Sanitize(v any) (any, error) {
 	// needs exactly the same traversal over exactly the same edges.
 	//
 	// Running them as two passes cost 12 allocations per row on a clean listing
-	// where one pass costs 6, and left separate walkers whose edge sets had to
-	// stay in lockstep by convention alone.
+	// against 6 for one pass, and left separate walkers whose edge sets had to
+	// stay in lockstep by convention alone. Both of those figures are history:
+	// the walk below no longer uses reflect for the common shapes, so a clean
+	// payload now costs 0 per row.
 	//
 	// Gating at the ROOT rather than at every container is what keeps this
 	// linear. A per-container gate re-scanned each subtree at every level, so a
