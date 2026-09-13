@@ -42,33 +42,52 @@ echo "=== benchstat comparison ==="
 benchstat "$BASE" "$HEAD" || true
 echo
 
-benchstat -format csv "$BASE" "$HEAD" 2>/dev/null > /tmp/benchgate.csv
+# mktemp rather than a fixed /tmp path: two concurrent runs would otherwise
+# clobber each other's CSV, and a predictable name in a shared /tmp is a symlink
+# hazard on any machine that is not a single-use CI runner.
+CSV=$(mktemp "${TMPDIR:-/tmp}/benchgate.XXXXXX")
+trap 'rm -f "$CSV"' EXIT
+
+benchstat -format csv "$BASE" "$HEAD" 2>/dev/null > "$CSV"
 
 awk -F, \
   -v time_thr="$TIME_THRESHOLD" \
   -v alloc_thr="$ALLOC_THRESHOLD" '
   # Header row for a metric block, e.g. ",sec/op,CI,sec/op,CI,vs base,P".
   # Identified by the CI marker in column 3, which a filename row never has.
-  $2 ~ /\/op$/ && $3 == "CI" { metric = $2; next }
+  $2 ~ /\/op$/ && $3 == "CI" { metric = $2; seen_metrics++; next }
 
   # Not a data row: preamble (goos/goarch/pkg/cpu), filename rows, blank
   # separators, and the trailing geomean summary.
-  NF < 6         { next }
-  $1 == ""       { next }
-  $1 == "geomean"{ next }
-  metric == ""   { next }
+  $1 == ""        { next }
+  $1 == "geomean" { next }
+  metric == ""    { next }
 
   {
     name  = $1
     base  = $2
+    head  = $4
     delta = $6
 
-    # A benchmark added by this PR has no base measurement. Nothing to compare,
-    # and it must not be mistaken for a regression.
-    if (base == "" || delta == "") { new_bench[name] = 1; next }
+    # Which side carries a measurement, NOT how many fields the row has.
+    #
+    # THIS LINE WAS THE BUG. The guard here used to be `NF < 6`, which looked
+    # reasonable and was not: benchstat TRUNCATES a row when a benchmark is
+    # missing from one side. A head-only benchmark renders as "Name,,,val,CI"
+    # (5 fields) and a base-only one as "Name,val,CI" (3), so the old guard
+    # discarded exactly the rows the next branch existed to report. The
+    # new-benchmark message was dead code and never once fired across two PRs.
+    #
+    # The part that was not merely cosmetic: a benchmark that FAILED to run on
+    # the base side truncates identically, so it vanished without a word.
+    if (base == "" && head == "") { next }
+    if (base == "") { if (!(name in added))   { added[name]   = 1; nadded++   } next }
+    if (head == "") { if (!(name in removed)) { removed[name] = 1; nremoved++ } next }
+
+    compared++
 
     # "~" means benchstat found no statistically significant difference.
-    if (delta == "~") next
+    if (delta == "" || delta == "~") next
 
     pct = delta
     gsub(/[+%]/, "", pct)
@@ -96,7 +115,26 @@ awk -F, \
       for (i = 1; i <= nt; i++) print tolerated[i]
       print ""
     }
-    for (n in new_bench) { print "New benchmark, no base to compare: " n }
+    if (nadded > 0) {
+      print "New benchmarks, no base to compare:"
+      for (n in added) print "  " n
+      print ""
+    }
+    if (nremoved > 0) {
+      print "Absent from this branch (deleted, or failed to run on base):"
+      for (n in removed) print "  " n
+      print ""
+    }
+
+    # The count is not decoration. The bug above was invisible precisely because
+    # a parser that silently drops rows prints the same thing as one that has
+    # nothing to say. A run that compared zero measurements is broken, not clean.
+    printf "Compared %d benchmark measurement(s) across %d metric(s).\n", compared + 0, seen_metrics + 0
+
+    if (compared + 0 == 0) {
+      print "::error::no benchmark measurements were compared — the gate parsed nothing and cannot vouch for this change"
+      exit 1
+    }
 
     if (nf > 0) {
       print ""
@@ -107,4 +145,4 @@ awk -F, \
     }
     print "No regression. go-axi is as fast and as lean as its base."
   }
-' /tmp/benchgate.csv
+' "$CSV"
