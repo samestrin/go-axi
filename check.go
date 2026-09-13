@@ -38,6 +38,8 @@ const (
 	TierLossy
 )
 
+// String names the tier for logs and test failures. It is not part of any
+// output format: consumers switch on the Tier constant, never on this text.
 func (t Tier) String() string {
 	switch t {
 	case TierTabular:
@@ -109,52 +111,39 @@ func lossyReason(t reflect.Type) string {
 // `rows[2]:` with no field list and falls back to indented list items.
 var tabularHeader = regexp.MustCompile(`(?m)^\s*[^\[\]{}:]*\[\d+[^\]]*\]\{[^}]*\}:`)
 
-// isTabularHeader checks whether b contains a TOON tabular array header,
-// matching the pattern of tabularHeader without running the regexp engine.
+// bracedFieldList is the two bytes tabularHeader cannot match without.
+//
+// The pattern ends `\]\{[^}]*\}:`, so `]` IMMEDIATELY followed by `{` has to
+// appear literally. Their absence is therefore proof of no match, which makes
+// the cheap scan below a sound way to skip the engine rather than a heuristic.
+var bracedFieldList = []byte("]{")
+
+// isTabularHeader reports whether b contains a TOON tabular array header.
+//
+// tabularHeader remains the single definition of what that means. This only
+// decides when running it can be skipped, so the two cannot drift apart —
+// TestIsTabularHeader_AgreesWithTheRegexp pins the equivalence anyway.
+//
+// WHY THE SKIP EARNS ITS PLACE, measured rather than assumed. The engine is
+// cheap on tabular output — 526ns at 2000 rows, against roughly 1,043,000ns to
+// encode the same payload, so 0.05% and not worth a line of code. It is the
+// LIST shape that hurts: a non-uniform array emits indented list items with no
+// braces anywhere, and the engine then costs 932,009ns at 2000 lines, rivalling
+// the entire encode. A payload with no `]{` in it exits here after one scan.
+//
+// This replaced a hand-rolled parser of the whole pattern, which was 47x faster
+// on tabular input and wrong: under `(?m)` the pattern's negated classes all
+// admit a newline, so it can bridge a header across lines, while the parser
+// restarted at every one. `rows[2\nx]{a}:` matched the pattern and not the
+// parser, and the answer sets Verdict.Tier, a public field callers route on.
+// Correcting it exactly would have meant letting its runs span newlines too,
+// which makes it quadratic on precisely the list shape it exists to speed up —
+// and reachable, since digits and newlines both survive sanitizing.
 func isTabularHeader(b []byte) bool {
-	for len(b) > 0 {
-		i := 0
-		for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r') {
-			i++
-		}
-		for i < len(b) && b[i] != '[' && b[i] != ']' && b[i] != '{' && b[i] != '}' && b[i] != ':' && b[i] != '\n' && b[i] != '\r' {
-			i++
-		}
-		if i < len(b) && b[i] == '[' {
-			i++
-			digits := 0
-			for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-				digits++
-				i++
-			}
-			if digits > 0 {
-				for i < len(b) && b[i] != ']' && b[i] != '\n' && b[i] != '\r' {
-					i++
-				}
-				if i < len(b) && b[i] == ']' {
-					i++
-					if i < len(b) && b[i] == '{' {
-						i++
-						for i < len(b) && b[i] != '}' && b[i] != '\n' && b[i] != '\r' {
-							i++
-						}
-						if i < len(b) && b[i] == '}' {
-							i++
-							if i < len(b) && b[i] == ':' {
-								return true
-							}
-						}
-					}
-				}
-			}
-		}
-		idx := bytes.IndexByte(b, '\n')
-		if idx < 0 {
-			break
-		}
-		b = b[idx+1:]
+	if !bytes.Contains(b, bracedFieldList) {
+		return false
 	}
-	return false
+	return tabularHeader.Match(b)
 }
 
 // Check reports whether v can be encoded as TOON without losing data, what

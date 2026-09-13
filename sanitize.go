@@ -26,6 +26,8 @@ type KeyCollisionError struct {
 	Second  any // the key that would have overwritten it
 }
 
+// Error quotes both original keys with %#v, so the invisible byte that made
+// them collide is readable in a terminal that would not render it.
 func (e *KeyCollisionError) Error() string {
 	return fmt.Sprintf(
 		"goaxi: map keys %#v and %#v both sanitize to %#v; "+
@@ -50,10 +52,32 @@ type CycleError struct {
 	Type string // the type the cycle was detected in
 }
 
+// Error names the type the cycle was found in, and says why the value is
+// refused rather than encoded.
 func (e *CycleError) Error() string {
 	return fmt.Sprintf(
 		"goaxi: value of type %s contains a reference cycle; TOON cannot represent one, "+
 			"and walking it would exhaust the stack and kill the process", e.Type)
+}
+
+// pathPool recycles the identity set fastInspect tracks the current path in.
+//
+// It MUST be handed back empty. The set means "these nodes are on the path I am
+// walking now", so a stale entry makes the next walk that draws this map report
+// a cycle for an acyclic payload — and MustSanitize turns that into a panic.
+// Sanitize clears it on the cycle branch, where fastInspect unwinds without
+// popping; on the clean branch every frame has already popped its own entry.
+//
+// Declared ABOVE Sanitize's doc comment on purpose. A package-level declaration
+// sitting between a comment and the function it describes reattaches the whole
+// comment to that declaration, which compiles, vets and reads correctly while
+// rendering the function undocumented. That happened here and cost Sanitize all
+// 60 lines below, including the concurrency hazard.
+// TestExportedSymbolsAreDocumented now fails if it happens again.
+var pathPool = sync.Pool{
+	New: func() any {
+		return make(map[nodeID]bool, 16)
+	},
 }
 
 // Sanitize returns v with every string cleaned of characters that would either
@@ -113,12 +137,6 @@ func (e *CycleError) Error() string {
 // *KeyCollisionError for two map keys that clean to the same string. A caller
 // whose keys are fixed identifiers and whose shapes are acyclic can rule both
 // out and use MustSanitize.
-var pathPool = sync.Pool{
-	New: func() any {
-		return make(map[nodeID]bool, 16)
-	},
-}
-
 func Sanitize(v any) (any, error) {
 	if v == nil {
 		return nil, nil
