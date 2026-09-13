@@ -65,8 +65,6 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 			return true
 		}
 		path[id] = true
-		defer delete(path, id)
-
 		for k, val := range x {
 			// A string key needs no boxing at all. It still has to be checked:
 			// a key becomes a field name in tabular output, so a control byte
@@ -78,6 +76,7 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 				return true
 			}
 		}
+		delete(path, id)
 		return false
 
 	case []any:
@@ -93,13 +92,13 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 			return true
 		}
 		path[id] = true
-		defer delete(path, id)
 
 		for _, e := range x {
 			if fastInspect(e, path, dirty) {
 				return true
 			}
 		}
+		delete(path, id)
 		return false
 
 	case []string:
@@ -122,13 +121,13 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 			return true
 		}
 		path[id] = true
-		defer delete(path, id)
 
 		for _, s := range x {
 			if !*dirty && cleanString(s) != s {
 				*dirty = true
 			}
 		}
+		delete(path, id)
 		return false
 
 	default:

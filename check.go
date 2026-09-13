@@ -1,12 +1,14 @@
 package goaxi
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	toon "github.com/toon-format/toon-go"
@@ -107,6 +109,54 @@ func lossyReason(t reflect.Type) string {
 // `rows[2]:` with no field list and falls back to indented list items.
 var tabularHeader = regexp.MustCompile(`(?m)^\s*[^\[\]{}:]*\[\d+[^\]]*\]\{[^}]*\}:`)
 
+// isTabularHeader checks whether b contains a TOON tabular array header,
+// matching the pattern of tabularHeader without running the regexp engine.
+func isTabularHeader(b []byte) bool {
+	for len(b) > 0 {
+		i := 0
+		for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r') {
+			i++
+		}
+		for i < len(b) && b[i] != '[' && b[i] != ']' && b[i] != '{' && b[i] != '}' && b[i] != ':' && b[i] != '\n' && b[i] != '\r' {
+			i++
+		}
+		if i < len(b) && b[i] == '[' {
+			i++
+			digits := 0
+			for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+				digits++
+				i++
+			}
+			if digits > 0 {
+				for i < len(b) && b[i] != ']' && b[i] != '\n' && b[i] != '\r' {
+					i++
+				}
+				if i < len(b) && b[i] == ']' {
+					i++
+					if i < len(b) && b[i] == '{' {
+						i++
+						for i < len(b) && b[i] != '}' && b[i] != '\n' && b[i] != '\r' {
+							i++
+						}
+						if i < len(b) && b[i] == '}' {
+							i++
+							if i < len(b) && b[i] == ':' {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+		idx := bytes.IndexByte(b, '\n')
+		if idx < 0 {
+			break
+		}
+		b = b[idx+1:]
+	}
+	return false
+}
+
 // Check reports whether v can be encoded as TOON without losing data, what
 // shape the payload takes, and whether TOON actually costs less than JSON.
 //
@@ -153,6 +203,18 @@ func CheckSanitized(v any, clean any) Verdict {
 	return verdict
 }
 
+var seenNodePool = sync.Pool{
+	New: func() any {
+		return make(map[nodeID]bool, 64)
+	},
+}
+
+var seenTypePool = sync.Pool{
+	New: func() any {
+		return make(map[reflect.Type]bool, 16)
+	},
+}
+
 // verdictFor is the single pass behind CheckSanitized and EncodeChecked.
 //
 // It returns the verdict AND the TOON bytes the verdict was derived from, so a
@@ -168,11 +230,24 @@ func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	// lossy type declared in an empty or nil container, which holds no values to
 	// inspect. The value walk catches a lossy type reaching an `any` field,
 	// whose static type says nothing about what it holds.
-	if reason := lossyInType(reflect.TypeOf(v), map[reflect.Type]bool{}); reason != "" {
+	typeSeen := seenTypePool.Get().(map[reflect.Type]bool)
+	if reason := lossyInType(reflect.TypeOf(v), typeSeen); reason != "" {
+		clear(typeSeen)
+		seenTypePool.Put(typeSeen)
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
-	if reason := fastLossyInValue(v, map[nodeID]bool{}); reason != "" {
+	clear(typeSeen)
+	seenTypePool.Put(typeSeen)
+
+	nodeSeen := seenNodePool.Get().(map[nodeID]bool)
+	if reason := fastLossyInValue(v, nodeSeen); reason != "" {
+		clear(nodeSeen)
+		seenNodePool.Put(nodeSeen)
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
+	}
+	if len(nodeSeen) <= maxLossyMemo {
+		clear(nodeSeen)
+		seenNodePool.Put(nodeSeen)
 	}
 
 	// Measurements are taken on the SANITIZED value, because that is what Encode
@@ -207,7 +282,7 @@ func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	}
 
 	verdict := Verdict{OK: true, Tier: TierNested}
-	if tabularHeader.Match(b) {
+	if isTabularHeader(b) {
 		verdict.Tier = TierTabular
 	}
 

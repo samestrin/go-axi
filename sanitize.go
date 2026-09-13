@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -112,47 +113,43 @@ func (e *CycleError) Error() string {
 // *KeyCollisionError for two map keys that clean to the same string. A caller
 // whose keys are fixed identifiers and whose shapes are acyclic can rule both
 // out and use MustSanitize.
+var pathPool = sync.Pool{
+	New: func() any {
+		return make(map[nodeID]bool, 16)
+	},
+}
+
 func Sanitize(v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	rv := reflect.ValueOf(v)
 
-	// ONE walk, TWO answers.
-	//
-	// Refusing a cycle has to happen before any rebuild begins: sanitizeValue
-	// follows pointers with no seen-set, so a cycle never reaches its error
-	// return — it exhausts the stack and kills the process, and recover() cannot
-	// catch that. The dirtiness answer rides along for free, because deciding it
-	// needs exactly the same traversal over exactly the same edges.
-	//
-	// Running them as two passes cost 12 allocations per row on a clean listing
-	// against 6 for one pass, and left separate walkers whose edge sets had to
-	// stay in lockstep by convention alone. Both of those figures are history:
-	// the walk below no longer uses reflect for the common shapes, so a clean
-	// payload now costs 0 per row.
-	//
-	// Gating at the ROOT rather than at every container is what keeps this
-	// linear. A per-container gate re-scanned each subtree at every level, so a
-	// payload dirty only at the bottom cost O(n × depth): 3.97 SECONDS for a value
-	// nested 10,000 deep, which is exactly the depth encoding/json accepts before
-	// rejecting at 10,001. It also made ONE hostile byte 23x more expensive than a
-	// payload dirty at every level, because dirt near the top lets each gate exit
-	// early while dirt at the bottom makes every gate scan the whole way down. One
-	// scan at the root is 14ms for that same input, and cheaper on ordinary
-	// payloads too — a fully dirty 500-row listing went from 27,033 allocations to
-	// 11,017.
-	// fastInspect rather than inspect: same two answers, but it type-switches the
-	// shapes a TOON payload is actually made of instead of boxing a reflect.Value
-	// for every map key and value, and hands anything else to inspect unchanged.
-	// A clean 500-row listing costs 1 allocation here rather than 3,002.
+	// Fast path for leaf scalars and plain strings: no map allocation, no reflection.
+	switch x := v.(type) {
+	case string:
+		cleaned := cleanString(x)
+		if cleaned == x {
+			return v, nil
+		}
+		return cleaned, nil
+	case int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, bool:
+		return v, nil
+	}
+
 	var dirty bool
-	if fastInspect(v, map[nodeID]bool{}, &dirty) {
+	path := pathPool.Get().(map[nodeID]bool)
+	if fastInspect(v, path, &dirty) {
+		clear(path)
+		pathPool.Put(path)
 		return nil, &CycleError{Type: typeName(reflect.TypeOf(v))}
 	}
+	pathPool.Put(path)
 	if !dirty {
 		return v, nil
 	}
+	rv := reflect.ValueOf(v)
 	out, _, err := sanitizeValue(rv)
 	if err != nil {
 		return nil, err
@@ -422,6 +419,21 @@ func sanitizeValue(v reflect.Value) (reflect.Value, bool, error) {
 	}
 }
 
+// asciiSafe maps ASCII bytes to whether they are guaranteed safe in TOON output
+// (printable ASCII 0x20..0x7e, plus \t, \n, \r). Bytes >= 0x80 are non-ASCII and
+// fall through to UTF-8 rune decoding.
+var asciiSafe [256]bool
+
+func init() {
+	for b := 0; b < 256; b++ {
+		if b < 0x80 {
+			if b == '\n' || b == '\r' || b == '\t' || (b >= 0x20 && b <= 0x7e) {
+				asciiSafe[b] = true
+			}
+		}
+	}
+}
+
 // cleanString drops unsafe runes and invalid UTF-8 bytes.
 //
 // The scan is manual rather than a range loop because range cannot distinguish a
@@ -432,10 +444,19 @@ func cleanString(s string) string {
 	// and copy. A clean string — the common case by far — is walked exactly once
 	// and returns itself.
 	//
-	// The previous version asked isClean first, which cost a full utf8.ValidString
-	// scan plus a full range loop, then scanned a third time to rebuild a dirty
-	// string. atcr's review flagged it as a double scan; it was worse than that.
-	for i := 0; i < len(s); {
+	// ASCII bytes are checked via asciiSafe without rune decoding. Non-ASCII
+	// bytes fall through to utf8.DecodeRuneInString.
+	i := 0
+	for i < len(s) {
+		b := s[i]
+		if asciiSafe[b] {
+			i++
+			continue
+		}
+		if b < 0x80 {
+			// Unsafe ASCII control rune or 0x7f (DEL)
+			return cleanFrom(s, i)
+		}
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if (r == utf8.RuneError && size == 1) || unsafeRune(r) {
 			return cleanFrom(s, i)
@@ -453,13 +474,26 @@ func cleanFrom(s string, i int) string {
 	b.Grow(len(s))
 	b.WriteString(s[:i])
 	for i < len(s) {
+		c := s[i]
+		if asciiSafe[c] {
+			start := i
+			for i < len(s) && asciiSafe[s[i]] {
+				i++
+			}
+			b.WriteString(s[start:i])
+			continue
+		}
+		if c < 0x80 {
+			i++ // invalid/unsafe ASCII control byte: drop
+			continue
+		}
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
 			i++ // invalid byte: drop it
 			continue
 		}
 		if !unsafeRune(r) {
-			b.WriteRune(r)
+			b.WriteString(s[i : i+size])
 		}
 		i += size
 	}
