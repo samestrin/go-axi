@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // fastInspect and inspect are two implementations of one traversal, and the
@@ -123,6 +124,81 @@ func TestFastInspect_LeavesThePathSetEmpty(t *testing.T) {
 	}
 	if len(path) != 0 {
 		t.Errorf("path set must be empty after the walk, got %d entries", len(path))
+	}
+}
+
+// The same agreement requirement as the walk above, for the lossy pair.
+//
+// This one carries an extra trap: a WRONG answer here is silent data loss, not a
+// crash. lossyInValue exists because toon-go drops a TextMarshaler's value while
+// still emitting its key, so if the fast lane ever answers "no loss" for a
+// payload that has one, the command prints a field with its contents missing and
+// exits zero. Every shape below that should be lossy is included precisely
+// because a false negative is invisible.
+//
+// Defined types matter here more than anywhere else. A Go type switch matches
+// only exact unnamed types, so `type Kind string` and a named map type do NOT
+// hit the fast arms and fall through to reflect — which is what makes skipping
+// the builtin arms sound.
+func TestFastLossyInValue_AgreesWithReflect(t *testing.T) {
+	type inner struct {
+		M textMarshaler `toon:"m"`
+	}
+	type kinded struct {
+		K definedString `toon:"k"`
+	}
+
+	shared := []any{"a", "b"}
+	lossyShared := []any{textMarshaler{v: "SECRET"}}
+
+	deep := any(map[string]any{"m": textMarshaler{v: "SECRET"}})
+	for i := 0; i < 60; i++ {
+		deep = map[string]any{"next": deep}
+	}
+
+	shapes := []struct {
+		name string
+		in   any
+	}{
+		// Not lossy: the fast arms must return "" for all of these.
+		{"clean rows", benchRows(20, false)},
+		{"dirty rows", benchRows(20, true)},
+		{"plain string", "hello"},
+		{"scalars", map[string]any{"i": 42, "f": 3.5, "b": true, "u": uint8(3)}},
+		{"nil map", map[string]any(nil)},
+		{"empty map", map[string]any{}},
+		{"nil slice", []any(nil)},
+		{"empty slice", []any{}},
+		{"string slice", []string{"a", "b"}},
+		{"time.Time is special-cased", map[string]any{"at": time.Now()}},
+		{"shared clean slice twice", map[string]any{"a": shared, "b": shared}},
+
+		// Lossy: a false negative in any of these is silent data loss.
+		{"marshaler at top level", textMarshaler{v: "x"}},
+		{"marshaler in a map value", map[string]any{"m": textMarshaler{v: "x"}}},
+		{"marshaler in an any slice", map[string]any{"r": []any{textMarshaler{v: "x"}}}},
+		{"marshaler in a struct", inner{M: textMarshaler{v: "x"}}},
+		{"marshaler behind a pointer", &textMarshaler{v: "x"}},
+		{"marshaler in a shared node", map[string]any{"a": lossyShared, "b": lossyShared}},
+		{"marshaler at 60 levels", deep},
+		{"marshaler beside a timestamp", map[string]any{"at": time.Now(), "m": textMarshaler{v: "x"}}},
+
+		// Defined types must fall through to reflect, not hit the fast arms.
+		{"defined string type", kinded{K: "resolved"}},
+		{"defined string in a map", map[string]any{"k": definedString("x")}},
+		{"typed map", map[string]string{"k": "v"}},
+		{"array", [2]string{"a", "b"}},
+	}
+
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			ref := lossyInValue(reflect.ValueOf(s.in), map[nodeID]bool{})
+			fast := fastLossyInValue(s.in, map[nodeID]bool{})
+
+			if (ref != "") != (fast != "") {
+				t.Errorf("lossy answer differs: lossyInValue=%q fastLossyInValue=%q", ref, fast)
+			}
+		})
 	}
 }
 

@@ -109,3 +109,88 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 		return inspect(reflect.ValueOf(v), path, dirty)
 	}
 }
+
+// fastLossyInValue answers the same question as lossyInValue — does any value in
+// here have a type toon-go silently drops — without boxing a reflect.Value per
+// map entry.
+//
+// Same motivation and same shape as fastInspect. Profiling put this walk at
+// 25.85% of EncodeOrJSON's allocations, essentially all of it MapIter.Key and
+// MapIter.Value boxing, which is the entire gap between EncodeOrJSON and a bare
+// Encode.
+//
+// WHY THE FAST ARMS ARE SAFE TO SKIP OUTRIGHT. The question is whether a type
+// implements encoding.TextMarshaler. A builtin has no method set, so string,
+// the integer and float kinds and bool cannot. Neither can the unnamed types
+// map[string]any, []any or []string. A type switch matches only those exact
+// unnamed types: a DEFINED type — type Kind string, or a named map type
+// carrying MarshalText — does not match and falls through to the reflect walk.
+// That is exactly right, because defined string types and TextMarshaler are the
+// two constructs this walk exists to catch.
+//
+// Keys are not walked, unlike inspect's map arm. A key here is a string, which
+// cannot be lossy; inspect walks keys because a POINTER key can close a cycle,
+// which is a different question.
+//
+// MEMO POLICY, and it is the opposite of fastInspect's. Entries are KEPT, never
+// popped, because this walk memoizes "no loss below this node" — a node already
+// cleared stays cleared however it is reached again. fastInspect pops, because
+// it asks whether a node is on the CURRENT path and without popping every DAG
+// would read as a cycle. The two sets must not be shared, and are not: each walk
+// is handed its own.
+//
+// Termination therefore does not depend on depth, which matters because
+// CheckSanitized is public and reaches this on a raw value with no cycle
+// pre-check of its own.
+func fastLossyInValue(v any, seen map[nodeID]bool) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+
+	case string,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, bool:
+		return ""
+
+	case map[string]any:
+		if x == nil {
+			return ""
+		}
+		id := nodeID{ptr: reflect.ValueOf(x).Pointer()}
+		if seen[id] {
+			return ""
+		}
+		seen[id] = true
+
+		for _, val := range x {
+			if reason := fastLossyInValue(val, seen); reason != "" {
+				return reason
+			}
+		}
+		return ""
+
+	case []any:
+		if len(x) == 0 {
+			return ""
+		}
+		id := nodeID{ptr: reflect.ValueOf(x).Pointer(), len: len(x)}
+		if seen[id] {
+			return ""
+		}
+		seen[id] = true
+
+		for _, e := range x {
+			if reason := fastLossyInValue(e, seen); reason != "" {
+				return reason
+			}
+		}
+		return ""
+
+	case []string:
+		return ""
+
+	default:
+		return lossyInValue(reflect.ValueOf(v), seen)
+	}
+}
