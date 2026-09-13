@@ -171,7 +171,7 @@ func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	if reason := lossyInType(reflect.TypeOf(v), map[reflect.Type]bool{}); reason != "" {
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
-	if reason := lossyInValue(reflect.ValueOf(v), map[nodeID]bool{}); reason != "" {
+	if reason := fastLossyInValue(v, map[nodeID]bool{}); reason != "" {
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
 

@@ -491,6 +491,68 @@ func TestEncodeOrJSON_DoesNotMarshalTheSameValueTwice(t *testing.T) {
 	}
 }
 
+// The guard must cost little over a bare Encode.
+//
+// This is the acceptance criterion the output-path work was measured against,
+// which until now existed only as prose in a plan file. EncodeOrJSON does
+// everything Encode does and adds ONE lossy walk over the payload to decide
+// whether TOON can carry it losslessly. That walk is the entire difference
+// between them, so this ratio is precisely the guard's price.
+//
+// Measured 1.36x while that walk still used reflect — 45,990 allocations against
+// Encode's 33,941 at 2000 rows, a gap of about 6 per row from boxing a
+// reflect.Value for every map key and every map value. Sanitize's walk stopped
+// paying that; this one had not.
+//
+// Asserted as the guard's ABSOLUTE marginal cost per row, not as a ratio.
+//
+// A ratio was wrong here, and wrong in a direction I argued for in a comment
+// that this replaces. guarded/encode = 1 + walk/encode, so making Encode CHEAPER
+// raises the ratio and trips the bound while the guard itself is unchanged. The
+// old comment claimed "a cheaper Encode narrowing that gap is the result it is
+// asking for", which confused the absolute gap with the ratio actually being
+// asserted. That is the same defect as the sibling test above — a denominator
+// under active optimisation — reintroduced one function below the place it was
+// removed, and caught by review rather than by me.
+//
+// The difference is the robust form. Both figures come from the same run, so a
+// toolchain that changes how reflect boxes map iteration moves them together and
+// cancels out of the subtraction. A ratio does not cancel; it amplifies.
+//
+// Measured 6.1 allocations per row while the lossy walk still used reflect
+// (45,990 against 33,941 at 2000 rows). It is 0.02 now. A ceiling of 1.0 fails
+// the moment per-entry boxing returns to that walk.
+func TestEncodeOrJSON_GuardCostsLittleOverEncode(t *testing.T) {
+	const (
+		rows           = 200
+		maxPerRowAdded = 1.0
+	)
+
+	v := losslessRows(rows)
+
+	if got := Check(v); !got.OK {
+		t.Fatalf("fixture must be lossless, got %q", got.Reason)
+	}
+
+	encode := testing.AllocsPerRun(20, func() {
+		if err := Encode(io.Discard, v); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+	})
+	guarded := testing.AllocsPerRun(20, func() {
+		if err := EncodeOrJSON(io.Discard, v); err != nil {
+			t.Fatalf("EncodeOrJSON: %v", err)
+		}
+	})
+
+	if perRow := (guarded - encode) / float64(rows); perRow > maxPerRowAdded {
+		t.Errorf("the guard adds %.2f allocations per row over a bare Encode (%.0f vs %.0f "+
+			"over %d rows), want at most %.2f. The difference is one lossy walk over the "+
+			"payload; a cost this high means that walk is boxing a reflect.Value per map entry.",
+			perRow, guarded, encode, rows, maxPerRowAdded)
+	}
+}
+
 // losslessRows builds a uniform listing of the shape a real command emits: a
 // scalar key or two beside a list of rows.
 func losslessRows(n int) map[string]any {
