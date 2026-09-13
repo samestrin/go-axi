@@ -54,6 +54,50 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
+  # go-axi is allowed to grow. It is not allowed to get slower. Four projects
+  # depend on this layer sitting off the hot path, and the only thing that keeps
+  # it there is a gate that fails.
+  #
+  # Pull requests only: the comparison needs a base commit to measure against,
+  # and a push to main has no meaningful counterpart.
+  bench:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit must be reachable to be checked out and measured.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          # The faster of the two supported toolchains. The floor (1.23) is
+          # covered by the test matrix; timing does not need both.
+          go-version: '1.26'
+          cache: true
+
+      - name: Install benchstat
+        # Pinned. An unpinned @latest would let a benchstat change alter the
+        # verdict on an unrelated pull request.
+        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
+
+      # count=6 matches the README's "medians of six runs" and is the floor
+      # benchstat needs: at count=3 it refuses a confidence interval, and it
+      # wants >= 4 samples before it will call a difference significant at all.
+      # benchtime=100ms keeps the whole job near a minute.
+      - name: Benchmark this branch
+        run: go test -run='^$' -bench=. -benchtime=100ms -count=6 . > /tmp/head.txt
+
+      - name: Benchmark the base commit
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          git checkout --detach ${{ github.event.pull_request.base.sha }}
+          go test -run='^$' -bench=. -benchtime=100ms -count=6 . > /tmp/base.txt
+          git checkout --detach "$HEAD_SHA"
+
+      - name: Enforce no regression
+        run: bash .github/benchgate.sh /tmp/base.txt /tmp/head.txt
+
   coverage:
     needs: test
     runs-on: ubuntu-latest
