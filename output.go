@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 
 	toon "github.com/toon-format/toon-go"
 )
@@ -174,6 +175,13 @@ func WriteHelp(w io.Writer, lines []string) error {
 //
 // An empty body writes nothing rather than a bare newline. A command with no
 // payload should be silent, not emit a blank line an agent pays tokens to read.
+var lineBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
 func writeLine(w io.Writer, b []byte) error {
 	if len(b) == 0 {
 		return nil
@@ -182,9 +190,17 @@ func writeLine(w io.Writer, b []byte) error {
 		_, err := w.Write(b)
 		return err
 	}
-	out := make([]byte, 0, len(b)+1)
-	out = append(out, b...)
-	out = append(out, '\n')
-	_, err := w.Write(out)
+	p := lineBufPool.Get().(*[]byte)
+	buf := (*p)[:0]
+	if cap(buf) < len(b)+1 {
+		buf = make([]byte, 0, len(b)+1)
+	}
+	buf = append(buf, b...)
+	buf = append(buf, '\n')
+	_, err := w.Write(buf)
+	if cap(buf) <= 65536 {
+		*p = buf
+		lineBufPool.Put(p)
+	}
 	return err
 }

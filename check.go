@@ -1,12 +1,14 @@
 package goaxi
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	toon "github.com/toon-format/toon-go"
@@ -36,6 +38,8 @@ const (
 	TierLossy
 )
 
+// String names the tier for logs and test failures. It is not part of any
+// output format: consumers switch on the Tier constant, never on this text.
 func (t Tier) String() string {
 	switch t {
 	case TierTabular:
@@ -107,6 +111,41 @@ func lossyReason(t reflect.Type) string {
 // `rows[2]:` with no field list and falls back to indented list items.
 var tabularHeader = regexp.MustCompile(`(?m)^\s*[^\[\]{}:]*\[\d+[^\]]*\]\{[^}]*\}:`)
 
+// bracedFieldList is the two bytes tabularHeader cannot match without.
+//
+// The pattern ends `\]\{[^}]*\}:`, so `]` IMMEDIATELY followed by `{` has to
+// appear literally. Their absence is therefore proof of no match, which makes
+// the cheap scan below a sound way to skip the engine rather than a heuristic.
+var bracedFieldList = []byte("]{")
+
+// isTabularHeader reports whether b contains a TOON tabular array header.
+//
+// tabularHeader remains the single definition of what that means. This only
+// decides when running it can be skipped, so the two cannot drift apart —
+// TestIsTabularHeader_AgreesWithTheRegexp pins the equivalence anyway.
+//
+// WHY THE SKIP EARNS ITS PLACE, measured rather than assumed. The engine is
+// cheap on tabular output — 526ns at 2000 rows, against roughly 1,043,000ns to
+// encode the same payload, so 0.05% and not worth a line of code. It is the
+// LIST shape that hurts: a non-uniform array emits indented list items with no
+// braces anywhere, and the engine then costs 932,009ns at 2000 lines, rivalling
+// the entire encode. A payload with no `]{` in it exits here after one scan.
+//
+// This replaced a hand-rolled parser of the whole pattern, which was 47x faster
+// on tabular input and wrong: under `(?m)` the pattern's negated classes all
+// admit a newline, so it can bridge a header across lines, while the parser
+// restarted at every one. `rows[2\nx]{a}:` matched the pattern and not the
+// parser, and the answer sets Verdict.Tier, a public field callers route on.
+// Correcting it exactly would have meant letting its runs span newlines too,
+// which makes it quadratic on precisely the list shape it exists to speed up —
+// and reachable, since digits and newlines both survive sanitizing.
+func isTabularHeader(b []byte) bool {
+	if !bytes.Contains(b, bracedFieldList) {
+		return false
+	}
+	return tabularHeader.Match(b)
+}
+
 // Check reports whether v can be encoded as TOON without losing data, what
 // shape the payload takes, and whether TOON actually costs less than JSON.
 //
@@ -153,6 +192,18 @@ func CheckSanitized(v any, clean any) Verdict {
 	return verdict
 }
 
+var seenNodePool = sync.Pool{
+	New: func() any {
+		return make(map[nodeID]bool, 64)
+	},
+}
+
+var seenTypePool = sync.Pool{
+	New: func() any {
+		return make(map[reflect.Type]bool, 16)
+	},
+}
+
 // verdictFor is the single pass behind CheckSanitized and EncodeChecked.
 //
 // It returns the verdict AND the TOON bytes the verdict was derived from, so a
@@ -168,11 +219,24 @@ func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	// lossy type declared in an empty or nil container, which holds no values to
 	// inspect. The value walk catches a lossy type reaching an `any` field,
 	// whose static type says nothing about what it holds.
-	if reason := lossyInType(reflect.TypeOf(v), map[reflect.Type]bool{}); reason != "" {
+	typeSeen := seenTypePool.Get().(map[reflect.Type]bool)
+	if reason := lossyInType(reflect.TypeOf(v), typeSeen); reason != "" {
+		clear(typeSeen)
+		seenTypePool.Put(typeSeen)
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
 	}
-	if reason := fastLossyInValue(v, map[nodeID]bool{}); reason != "" {
+	clear(typeSeen)
+	seenTypePool.Put(typeSeen)
+
+	nodeSeen := seenNodePool.Get().(map[nodeID]bool)
+	if reason := fastLossyInValue(v, nodeSeen); reason != "" {
+		clear(nodeSeen)
+		seenNodePool.Put(nodeSeen)
 		return Verdict{Tier: TierLossy, Reason: reason}, nil
+	}
+	if len(nodeSeen) <= maxLossyMemo {
+		clear(nodeSeen)
+		seenNodePool.Put(nodeSeen)
 	}
 
 	// Measurements are taken on the SANITIZED value, because that is what Encode
@@ -207,7 +271,7 @@ func verdictFor(v any, clean any, sizeCompare bool) (Verdict, []byte) {
 	}
 
 	verdict := Verdict{OK: true, Tier: TierNested}
-	if tabularHeader.Match(b) {
+	if isTabularHeader(b) {
 		verdict.Tier = TierTabular
 	}
 

@@ -4,6 +4,24 @@ All notable changes to this project are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major version is 0 the API is not frozen.
 
+## [v0.2.1] - 2026-09-13
+
+Performance only. No API change, and no observable behaviour change: the string cleaner was checked against the implementation it replaces over 200,000 random inputs including invalid UTF-8 and is byte-identical on every one, and tabular-header detection is unchanged because the regexp that defines it still decides every case.
+
+### Performance
+
+Medians of six runs on a 2000-row payload unless stated.
+
+- `SanitizeString` on a clean string: 52.1 ns to 18.8 ns for a sentence, 5.1 ns to 2.4 ns for a short string, still zero allocations. ASCII bytes are now classified by lookup instead of by decoding each rune.
+- `Sanitize` on a clean 500-row payload: 51.5 µs to 35.0 µs, still one allocation.
+- `EncodeOrJSON`: 1.28 ms to 1.17 ms. `EncodeChecked`: 1.25 ms to 1.16 ms, and about 8% less memory.
+- `Check`: 18.1 µs to 17.1 µs.
+- Tabular-header detection now skips the regexp engine when the payload cannot contain a header. This is negligible on tabular output — roughly 45 ns against the ~1 ms it takes to encode the same payload — but a 2000-line list previously cost 908 µs there, rivalling the entire encode, and now costs 480 ns.
+
+### Fixed
+
+- The identity set the loss walk uses is bounded rather than growing with the payload, and the buffer a line is written from is reused between calls.
+
 ## [v0.2.0] - 2026-09-12
 
 Minor rather than patch because two changes are visible to callers without being visible in any signature. Neither produces a compile error, so both are worth reading before upgrading.
@@ -83,6 +101,7 @@ First tagged release. Not a codec: toon-go encodes and decodes, and this is the 
 - `WriteHelp`, the one `help[]` form that survives its own codec.
 - `ExitCode`, one 0-4 set, as constants rather than prose in a style guide.
 
+[v0.2.1]: https://github.com/samestrin/go-axi/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/samestrin/go-axi/compare/v0.1.4...v0.2.0
 [v0.1.4]: https://github.com/samestrin/go-axi/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/samestrin/go-axi/compare/v0.1.2...v0.1.3
