@@ -105,6 +105,81 @@ func TestFastInspect_AgreesWithReflect(t *testing.T) {
 	}
 }
 
+// Values that CROSS between the two lanes mid-walk.
+//
+// Every shape in the table above stays in one lane or the other. This covers the
+// case neither reaches: a container entered through a fast arm, which keys its
+// identity from reflect.ValueOf(x).Pointer(), and the same container reached
+// again through the reflect fall-through, which keys from v.Pointer(). If those
+// two ever disagree, a DAG reads as a cycle or — far worse — a real cycle goes
+// undetected and sanitizeValue walks it into a fatal stack overflow.
+//
+// A struct is the natural bridge, since structs always fall through and
+// map[string]any always takes the fast arm.
+func TestFastInspect_AgreesAcrossLaneBoundaries(t *testing.T) {
+	type bridge struct {
+		M map[string]any `toon:"m"`
+		S []any          `toon:"s"`
+	}
+
+	// A cycle that closes through a struct: map -> struct -> same map.
+	mapThroughStruct := map[string]any{"name": "root"}
+	mapThroughStruct["b"] = bridge{M: mapThroughStruct}
+
+	// A cycle that closes through a struct from a slice: slice -> struct -> same slice.
+	sliceThroughStruct := make([]any, 1)
+	sliceThroughStruct[0] = bridge{S: sliceThroughStruct}
+
+	// A DAG, not a cycle: one map reached directly AND through a struct field.
+	// This must NOT be reported as a cycle.
+	sharedMap := map[string]any{"k": "v"}
+	dag := map[string]any{
+		"direct":    sharedMap,
+		"viaStruct": bridge{M: sharedMap},
+	}
+
+	// The same, for a slice.
+	sharedSlice := []any{"a", "b"}
+	sliceDag := map[string]any{
+		"direct":    sharedSlice,
+		"viaStruct": bridge{S: sharedSlice},
+	}
+
+	// A dirty string reachable only by crossing into the struct lane and back.
+	dirtyAcross := map[string]any{
+		"b": bridge{M: map[string]any{"note": "bad\x1bhere"}},
+	}
+
+	shapes := []struct {
+		name string
+		in   any
+	}{
+		{"cycle closing through a struct", mapThroughStruct},
+		{"slice cycle closing through a struct", sliceThroughStruct},
+		{"map reached directly and via a struct", dag},
+		{"slice reached directly and via a struct", sliceDag},
+		{"dirty string across a lane boundary", dirtyAcross},
+		{"struct wrapping clean containers", bridge{M: map[string]any{"k": "v"}, S: []any{"a"}}},
+	}
+
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			var refDirty, fastDirty bool
+			refCycle := inspect(reflect.ValueOf(s.in), map[nodeID]bool{}, &refDirty)
+			fastCycle := fastInspect(s.in, map[nodeID]bool{}, &fastDirty)
+
+			if refCycle != fastCycle {
+				t.Errorf("cycle answer differs across lanes: inspect=%v fastInspect=%v",
+					refCycle, fastCycle)
+			}
+			if refDirty != fastDirty {
+				t.Errorf("dirty answer differs across lanes: inspect=%v fastInspect=%v",
+					refDirty, fastDirty)
+			}
+		})
+	}
+}
+
 // The fast lane must leave the path set exactly as it found it, or a second call
 // sharing that set would see phantom cycles. inspect pops on the way out and so
 // must this.
