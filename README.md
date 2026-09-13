@@ -91,6 +91,48 @@ Full reference: [pkg.go.dev/github.com/samestrin/go-axi](https://pkg.go.dev/gith
 
 `Encode` sanitizes internally so a caller cannot forget, and writes nothing at all when encoding fails — a partial payload is worse than none, because it parses.
 
+### Choosing a format
+
+When a command supports `--toon` and `--json`, the choice is a value rather than a branch at every call site:
+
+| Symbol | Behavior |
+|---|---|
+| `Format` | `TOON` or `JSON`; `Default` is `TOON` |
+| `ParseFormat(s string) (Format, error)` | Maps a flag value to a `Format`; `""` selects `Default` |
+| `f.Encode(w io.Writer, v any) error` | Encode in that format, terminated by exactly one newline |
+| `f.EncodeProjected(w io.Writer, v any) error` | Same, but TOON field names come from the `json` tags |
+
+The format is chosen by the caller and never detected from the data. Output shape is a property of the command, not of the payload — a format that varied per call would force every consumer to handle both, and would make an instruction like "the third column is SEVERITY" unsafe to write down. `EncodeOrJSON` is the opposite policy, for callers with no design-time rule.
+
+**`EncodeProjected` exists because toon-go does not read the `json` struct tag.** A type carrying only `json` tags encodes to its Go identifiers — `Count: 3`, not `count: 3`. There are two ways out: add a duplicate `toon` tag to every field, or route the value through its JSON form first. `Encode` is the first, `EncodeProjected` is the second.
+
+Projection is not free. Medians of six runs on a 500-row payload, Apple M5:
+
+| Path | Time | Allocations |
+|---|---|---|
+| `Encode` | 257 µs | 5,427 |
+| `EncodeProjected` | 665 µs | 15,055 |
+
+Reproduce with `go test -run '^$' -bench Format_Encode -benchmem`. That is about 2.6× the time and 2.8× the allocations, so `Encode` stays the fast path and the default. Projection applies to TOON only — `encoding/json` already reads the `json` tag, so a JSON payload is passed straight through.
+
+### Catching a missing `toon` tag
+
+| Function | Behavior |
+|---|---|
+| `CheckTags(v any) TagVerdict` | Reports fields that would be published under their Go identifier |
+
+A missing `toon` tag does not error and does not produce empty output. It silently keys your payload on names no consumer was told to expect, which is the same defect class `Check` exists for. Assert it in a test over every type a command prints:
+
+```go
+if v := goaxi.CheckTags(SearchResult{}); !v.OK {
+	t.Error(v.String())
+}
+```
+
+A value that is already generic — a map, a slice, a scalar, or anything `EncodeProjected` produced — has no Go identifiers to leak and is always `OK`. Unexported fields and `json:"-"` fields are never encoded, so neither is flagged.
+
+`CheckTags` walks types rather than values, so its cost tracks the shape of the type and not the size of the payload: 368 ns and **zero allocations** on the benchmark payload. It terminates on a self-referential type.
+
 `EncodeChecked` is what you want when the guard matters and you are about to print. Calling `Check` and then `Encode` sanitizes and marshals the same value twice to serve one guard; `EncodeChecked` derives its verdict from the bytes it writes. Medians of six runs on a 2000-row payload, with a bare `Encode` as the floor:
 
 | Writer | Time | Against the floor |
