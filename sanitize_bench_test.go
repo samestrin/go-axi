@@ -93,26 +93,32 @@ func TestSanitize_CleanPayloadDoesNotPayToBeCopied(t *testing.T) {
 	clean := allocationsPerRow(t, false)
 	dirty := allocationsPerRow(t, true)
 
-	// FLOOR. Not zero. Sanitize walks a clean payload once, via inspect, and that
-	// single traversal costs 6.0 allocations per row of reflect map-iteration
-	// boxing — what any reflective walk of a map[string]any pays, not overhead
-	// this package adds. 6.0 is the floor; 31.0 was the starting point.
+	// THE FLOOR IS ZERO, and that is the point of this bound. Walking a clean
+	// payload requires no allocation at all: nothing is copied, nothing is built,
+	// and the only reason it ever cost anything was reflect boxing a Value for
+	// every map key and every map value. A walk that type-switches the shapes a
+	// TOON payload is actually made of — map[string]any, []any, string, scalars —
+	// boxes once per CONTAINER for identity tracking and not at all for keys.
+	//
+	// History of this figure: 31.0 allocations per row when every clean container
+	// was rebuilt, 12.0 once the copy was skipped but two separate walks remained,
+	// 6.0 after those merged into one, and 0.0 once that one walk stops using
+	// reflect for the common shapes.
 	//
 	// WHY A RATIO against the dirty path measured in the SAME run, rather than a
-	// fixed count. Both figures are dominated by that same boxing, so a toolchain
-	// changing how MapRange allocates moves them together and the ratio holds,
-	// where an absolute ceiling fails the suite with no code change at all. Two
-	// earlier bounds here were absolute and both were wrong — 10.0, from counting
-	// one walk when there were two, then 15.0, which three reviewers flagged.
+	// fixed count. An absolute AllocsPerRun ceiling is hostage to the runtime, so
+	// a toolchain that changes how MapRange allocates fails the suite with no code
+	// change at all. Two earlier bounds here were absolute and both were wrong —
+	// 10.0, from counting one walk when there were two, then 15.0, which three
+	// reviewers flagged.
 	//
-	// WHY 0.40. Reinstating the unconditional copy puts clean at 31.0 against
-	// roughly 32.0 dirty, a ratio near 0.97: both paths rebuild everything and the
-	// clean case has nothing left to save. The bound is tighter than that because
-	// it also pins the number of WALKS — two separate traversals measured 12.0
-	// against 22.0 dirty, a ratio of 0.55, where one traversal answering both
-	// questions measures about 6.0, a ratio near 0.27. At 0.40 this fails if
-	// either the copy returns or the walks split apart again.
-	const maxShare = 0.40
+	// WHY 0.10. Reinstating the unconditional copy puts clean at 31.0 against
+	// roughly 32.0 dirty, a ratio near 0.97. Skipping the copy but splitting the
+	// walks again gives 12.0 against 22.0, a ratio of 0.55. Keeping one merged
+	// walk but going back to reflect gives 6.0 against 22.0, a ratio of 0.27. A
+	// reflect-free walk gives 0.0, a ratio of 0.00. At 0.10 every one of those
+	// regressions fails and only the intended state passes.
+	const maxShare = 0.10
 
 	if share := clean / dirty; share > maxShare {
 		t.Errorf("a clean payload costs %.2f of what a dirty one costs (%.1f vs %.1f allocations "+
