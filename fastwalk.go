@@ -158,12 +158,17 @@ func fastInspect(v any, path map[nodeID]bool, dirty *bool) (cycle bool) {
 // cannot be lossy; inspect walks keys because a POINTER key can close a cycle,
 // which is a different question.
 //
-// MEMO POLICY, and it is the opposite of fastInspect's. Entries are KEPT, never
-// popped, because this walk memoizes "no loss below this node" — a node already
-// cleared stays cleared however it is reached again. fastInspect pops, because
-// it asks whether a node is on the CURRENT path and without popping every DAG
-// would read as a cycle. The two sets must not be shared, and are not: each walk
-// is handed its own.
+// MEMO POLICY, and it is still not fastInspect's. That walk pops every entry on
+// exit, because it asks whether a node is on the CURRENT path and without
+// popping every DAG would read as a cycle. This one memoizes "no loss below this
+// node", so a cleared node stays cleared however it is reached again.
+//
+// It keeps BOTH in one map, told apart by the value stored: true while a node is
+// on the path, false once it is walked and clear. Cleared entries are evicted
+// past maxLossyMemo so the map cannot grow to one entry per node; path entries
+// never are, because evicting one turns a cycle back into infinite recursion.
+// The two walks' sets must still not be shared, and are not: each is handed its
+// own.
 //
 // Termination therefore does not depend on depth, which matters because
 // CheckSanitized is public and reaches this on a raw value with no cycle
@@ -184,10 +189,12 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 			return ""
 		}
 		id := nodeID{ptr: reflect.ValueOf(x).Pointer()}
-		if seen[id] {
+		// Present at all means stop: true is a cycle, false is a cleared memo.
+		if _, visited := seen[id]; visited {
 			return ""
 		}
 		seen[id] = true
+		defer releaseLossyNode(seen, id)
 
 		for _, val := range x {
 			if reason := fastLossyInValue(val, seen); reason != "" {
@@ -201,10 +208,12 @@ func fastLossyInValue(v any, seen map[nodeID]bool) string {
 			return ""
 		}
 		id := nodeID{ptr: reflect.ValueOf(x).Pointer(), len: len(x)}
-		if seen[id] {
+		// Present at all means stop: true is a cycle, false is a cleared memo.
+		if _, visited := seen[id]; visited {
 			return ""
 		}
 		seen[id] = true
+		defer releaseLossyNode(seen, id)
 
 		for _, e := range x {
 			if reason := fastLossyInValue(e, seen); reason != "" {
