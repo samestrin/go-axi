@@ -91,12 +91,16 @@ Full reference: [pkg.go.dev/github.com/samestrin/go-axi](https://pkg.go.dev/gith
 
 `Encode` sanitizes internally so a caller cannot forget, and writes nothing at all when encoding fails — a partial payload is worse than none, because it parses.
 
-`EncodeChecked` is what you want when the guard matters and you are about to print. Calling `Check` and then `Encode` sanitizes and marshals the same value twice to serve one guard; `EncodeChecked` derives its verdict from the bytes it writes. Measured medians, with a bare `Encode` as the floor:
+`EncodeChecked` is what you want when the guard matters and you are about to print. Calling `Check` and then `Encode` sanitizes and marshals the same value twice to serve one guard; `EncodeChecked` derives its verdict from the bytes it writes. Medians of six runs on a 2000-row payload, with a bare `Encode` as the floor:
 
-| rows | `Encode` | `EncodeChecked` | `Check` + `Encode` |
-|---|---|---|---|
-| 100 | 134 µs | 156 µs (+16%) | 338 µs (+152%) |
-| 2000 | 2.91 ms | 3.32 ms (+14%) | 7.18 ms (+147%) |
+| Writer | Time | Against the floor |
+|---|---|---|
+| `Encode` | 1.05 ms | — |
+| `EncodeChecked` | 1.16 ms | +11% |
+| `EncodeOrJSON` | 1.17 ms | +12% |
+| `Check` then `Encode` | 2.77 ms | +164% |
+
+Reproduce with `go test -run '^$' -bench Output_Writers -benchmem`. The guard is worth about 11%; the rest of that last row is duplicated work.
 
 It writes nothing unless the verdict is `OK`, and its `Tier` describes the bytes actually emitted.
 
@@ -195,6 +199,22 @@ ExitValidation = 4 // ran correctly; the thing it checked did not pass
 `ExitCode` is a defined type with a `String()` method, so `os.Exit(int(goaxi.ExitValidation))`.
 
 `ExitValidation` is deliberately distinct from `ExitError`. A checker reporting "this does not conform" is a successful run with a real result, not a broken tool — and an agent cannot decide whether a retry is worthwhile if the two collapse into one code.
+
+## Performance
+
+The guard layer is not where your time goes. Medians of six runs, Apple M5, Go 1.26 — every figure below is produced by a committed benchmark rather than quoted from a commit message:
+
+| Operation | Cost | Allocations |
+|---|---|---|
+| `SanitizeString`, clean short string | 2.4 ns | 0 |
+| `SanitizeString`, clean sentence | 18.8 ns | 0 |
+| `Sanitize`, clean 500-row payload | 35 µs | **1** |
+| `Check`, clean 20-row payload | 17 µs | 486 |
+| `EncodeOrJSON`, 2000 rows | 1.17 ms | 33,974 |
+
+Two of those are worth calling out. Sanitizing a payload that needs no cleaning costs **one allocation regardless of size**, because a clean value is returned rather than rebuilt — see the memory note under [Guarantees](#guarantees). And a clean string is scanned without decoding a rune or allocating anything, so the common case of text that was already safe is close to free.
+
+What remains is dominated by `toon.Marshal` itself, not by this layer.
 
 ## What this adds to toon-go
 
