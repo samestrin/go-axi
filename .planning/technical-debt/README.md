@@ -4,7 +4,7 @@ Items found during review and consciously **not** resolved. Every row cites a cu
 
 The one genuine correctness defect in shipped behaviour — `sanitize.go:340`, pointer map keys being re-keyed — is RESOLVED as of 2026-09-12 on branch `td/2026-09-12`. A non-string map key is still walked, so errors from inside it propagate, but its rebuilt result is discarded and the caller's own key survives. Everything else open is cost, contract clarity, or test and comment quality.
 
-`.planning/` is gitignored in this repo (`.gitignore:10`), so this file is local-only, exactly like `STATUS.md` and `INTEGRATION.md`.
+`.planning/` is gitignored in this repo, so everything else in it — `STATUS.md`, `INTEGRATION.md`, plans, scratch — stays local. This file is the single tracked exception, committed so the no-mistakes pipeline can read and update the backlog: it runs in a disposable worktree built from the pushed branch, and an untracked file is invisible to it there.
 
 **Checkbox legend:** `[ ]` open · `[/]` deferred by an explicit decision · `[x]` resolved.
 
