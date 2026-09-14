@@ -53,6 +53,7 @@ package goaxi
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -171,8 +172,13 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 	rows := make([]string, 0, preallocRowCapacity(h.declared))
 	for sc.Scan() {
 		line++
-		raw := sc.Text()
-		if strings.TrimSpace(raw) == "" {
+		// sc.Bytes() aliases the scanner's internal buffer — valid only until the
+		// next Scan() — instead of sc.Text()'s fresh copy. Every use below either
+		// consumes it before the next iteration (bytes.TrimLeft returns a subslice,
+		// spent immediately by the append) or explicitly copies it (string(raw) for
+		// collectSiblings, which needs to outlive this loop).
+		raw := sc.Bytes()
+		if len(bytes.TrimSpace(raw)) == 0 {
 			// Today's reader skips a blank line between rows. Strict toon-go
 			// rejects one, so it is dropped here rather than forwarded.
 			continue
@@ -181,14 +187,14 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 			// End of this array's rows. A scalar `key: value` is sibling
 			// metadata worth keeping; anything else is a following block and
 			// not ours.
-			collectSiblings(sc, raw, doc.Meta)
+			collectSiblings(sc, string(raw), doc.Meta)
 			break
 		}
 		// Re-indented to exactly two spaces. toon-go requires the indent to be
 		// a multiple of two; the old reader accepted any leading whitespace and
 		// trimmed it, so normalising here preserves that tolerance instead of
 		// turning it into an error.
-		rows = append(rows, "  "+strings.TrimLeft(raw, " \t"))
+		rows = append(rows, "  "+string(bytes.TrimLeft(raw, " \t")))
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("toon: line %d: %w", line+1, err)
