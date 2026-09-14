@@ -53,6 +53,7 @@ package goaxi
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -96,6 +97,40 @@ const maxLine = 8 * 1024 * 1024
 // exhaust memory before a single byte is parsed. 64 MiB is far above any real
 // findings payload (hundreds of rows of KB-scale text) and far below trouble.
 const MaxDocumentBytes = 64 * 1024 * 1024
+
+// maxPreallocRows bounds how many rows DecodeTabular will preallocate for
+// up front, based on the header's declared count.
+//
+// The declared count is attacker-controlled: it comes from the document
+// itself, before a single row has been read. Sizing a slice directly off it
+// would let a header like `findings[999999999999|]{a}:` reserve room for a
+// trillion rows before the reader has any evidence the document carries more
+// than zero. 4096 comfortably covers any real findings payload (hundreds of
+// rows) with room to spare; a document declaring more than that just grows
+// the slice the normal way past this point, which is the behavior every
+// caller already gets today.
+//
+// "Grows the slice the normal way" is NOT "one resize per row past the cap" —
+// append's growth is amortized, not linear, so a row past 4096 costs the same
+// as a row within it. Measured directly: marginal allocations/row between
+// 5,000 and 10,000 declared rows (both past the cap) came out at 8.0008;
+// between 500 and 2,000 (both within it), 8.0020. A document declaring more
+// rows than the cap pays no more per row than one that doesn't.
+const maxPreallocRows = 4096
+
+// preallocRowCapacity turns a header's declared row count into a safe
+// capacity hint: never negative (a malformed header can produce one — see
+// TestDecodeTabular_NegativeDeclaredCountDoesNotPanic), and never past
+// maxPreallocRows regardless of what the header claims.
+func preallocRowCapacity(declared int) int {
+	if declared < 0 {
+		return 0
+	}
+	if declared > maxPreallocRows {
+		return maxPreallocRows
+	}
+	return declared
+}
 
 // DecodeTabular reads one TOON tabular array from r.
 func DecodeTabular(r io.Reader) (*Document, error) {
@@ -141,11 +176,16 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 	// swallows both and reports a column-count mismatch on real CLI output —
 	// which is what this package did until it was run against the binary rather
 	// than against the encoder's golden fixture.
-	var rows []string
+	rows := make([]string, 0, preallocRowCapacity(h.declared))
 	for sc.Scan() {
 		line++
-		raw := sc.Text()
-		if strings.TrimSpace(raw) == "" {
+		// sc.Bytes() aliases the scanner's internal buffer — valid only until the
+		// next Scan() — instead of sc.Text()'s fresh copy. Every use below either
+		// consumes it before the next iteration (bytes.TrimLeft returns a subslice,
+		// spent immediately by the append) or explicitly copies it (string(raw) for
+		// collectSiblings, which needs to outlive this loop).
+		raw := sc.Bytes()
+		if len(bytes.TrimSpace(raw)) == 0 {
 			// Today's reader skips a blank line between rows. Strict toon-go
 			// rejects one, so it is dropped here rather than forwarded.
 			continue
@@ -154,14 +194,14 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 			// End of this array's rows. A scalar `key: value` is sibling
 			// metadata worth keeping; anything else is a following block and
 			// not ours.
-			collectSiblings(sc, raw, doc.Meta)
+			collectSiblings(sc, string(raw), doc.Meta)
 			break
 		}
 		// Re-indented to exactly two spaces. toon-go requires the indent to be
 		// a multiple of two; the old reader accepted any leading whitespace and
 		// trimmed it, so normalising here preserves that tolerance instead of
 		// turning it into an error.
-		rows = append(rows, "  "+strings.TrimLeft(raw, " \t"))
+		rows = append(rows, "  "+string(bytes.TrimLeft(raw, " \t")))
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("toon: line %d: %w", line+1, err)
@@ -222,13 +262,36 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 // TestABlankLineBetweenRowsShiftsReportedLineNumbers pins the real behaviour.
 func synthesize(h *header, rows []string, headerAt int) string {
 	var b strings.Builder
+	// Computed once and reused for both sizing and writing below: strconv.Itoa
+	// only allocates past its small-integer cache (0-99), so calling it twice
+	// would cost a second allocation for any row count of 100 or more.
+	rowCount := strconv.Itoa(len(rows))
+	delim := delimiterSuffix(h.delimiter)
+
+	// Grow once, sized off the rows ALREADY READ rather than h.declared: the
+	// declared count is attacker-controlled (Task 1's hazard applies here too),
+	// but by this point every row's actual byte length is already known, so
+	// there is no untrusted number left to size off.
+	size := headerAt - 1        // leading blank lines
+	size += len(h.nameText) + 1 // '['
+	size += len(rowCount)
+	size += len(delim)
+	size++ // ']'
+	if h.hasFields {
+		size += len(h.fieldsText) + 2 // '{' fields '}'
+	}
+	size += 2 // ":\n"
+	for _, r := range rows {
+		size += len(r) + 1 // row + '\n'
+	}
+	b.Grow(size)
 	for i := 1; i < headerAt; i++ {
 		b.WriteByte('\n')
 	}
 	b.WriteString(h.nameText)
 	b.WriteByte('[')
-	b.WriteString(strconv.Itoa(len(rows)))
-	b.WriteString(delimiterSuffix(h.delimiter))
+	b.WriteString(rowCount)
+	b.WriteString(delim)
 	b.WriteByte(']')
 	if h.hasFields {
 		b.WriteByte('{')

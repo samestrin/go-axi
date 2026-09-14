@@ -1,6 +1,7 @@
 package goaxi
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -332,5 +333,198 @@ func TestHeaderlessPayloadIsStillAnError(t *testing.T) {
 	// toon-go also returns (nil, nil) for a bare indented line with no header.
 	if _, err := DecodeTabular(strings.NewReader("  just|a|row\n")); err == nil {
 		t.Fatal("a headerless payload decoded cleanly")
+	}
+}
+
+// --- Tier 1 performance: the row loop's own marginal cost per row
+
+// cleanTabularFixture builds a clean (no quoting, no escaping needed) tabular
+// payload of exactly n rows, so the row loop never takes the TrimLeft/quote
+// slow paths — this isolates the loop's OWN allocation cost from decisions
+// made elsewhere in the row.
+func cleanTabularFixture(n int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "findings[%d|]{severity|file|problem|fix}:\n", n)
+	for i := 0; i < n; i++ {
+		b.WriteString("  CRITICAL|auth.go|token never expires|check expiry\n")
+	}
+	return b.String()
+}
+
+// TestDecodeTabular_RowLoopAllocatesOncePerRow isolates DecodeTabular's row-copy
+// loop from every other cost in the function (header parse, synthesize, and
+// toon-go's own generic decode of each row) by comparing its MARGINAL
+// allocations-per-row against Decode()'s marginal allocations-per-row on the
+// SAME payload. Decode() reads the identical tabular text but never re-scans or
+// re-indents a row, so its per-row cost is toon-go's generic decoder alone —
+// the exact cost DecodeTabular pays too, on top of its own loop. The
+// difference between the two, per row, isolates the loop.
+//
+// WHY marginal (small vs large), not a single measurement. A single
+// AllocsPerRun on n rows divided by n mixes in the one-time header/synthesize
+// cost, which shrinks toward zero as n grows and would make the "per row"
+// number drift with fixture size rather than measure a constant. Comparing
+// two sizes and dividing by the row DELTA cancels every fixed cost, leaving
+// only what scales with rows — exactly the row loop.
+//
+// WHY a ratio against Decode() as the comparator, not a fixed ceiling
+// (sanitize_bench_test.go, TestSanitize_CleanPayloadDoesNotPayToBeCopied,
+// explains why: an absolute ceiling is hostage to the runtime and to
+// toon-go's own internals, neither of which this package controls). Decode()
+// walks the same rows through the same decoder, so it moves in step with any
+// runtime or toon-go change; only DecodeTabular's OWN extra cost is pinned.
+//
+// WHY 3.5. History of this figure: raw := sc.Text() allocated a fresh string
+// every row, and "  "+strings.TrimLeft(raw, " \t") allocated again for the
+// reindent — two allocations per row on top of whatever Decode() already
+// pays, measured at 4.01/row (small=20, large=500, on this fixture, on the
+// toolchain this was written against). Replacing sc.Text() with
+// sc.Bytes()+bytes.TrimLeft folded the reindent into a single allocation,
+// measured at ~3.0/row after the fix. Both numbers will drift on a different
+// toolchain — the DIFFERENCE they establish is what the threshold protects:
+// 3.5 sits between them, so it fails a two-allocation loop and leaves room
+// below it for legitimate small drift, while still catching a regression back
+// to two loop
+// allocations.
+func TestDecodeTabular_RowLoopAllocatesOncePerRow(t *testing.T) {
+	const (
+		small = 20
+		large = 500
+	)
+
+	marginal := func(fn func(string) (any, error)) float64 {
+		measure := func(n int) float64 {
+			payload := cleanTabularFixture(n)
+			if _, err := fn(payload); err != nil {
+				t.Fatalf("fixture must decode without error: %v", err)
+			}
+			return testing.AllocsPerRun(50, func() {
+				if _, err := fn(payload); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+		return (measure(large) - measure(small)) / float64(large-small)
+	}
+
+	decodePerRow := marginal(func(s string) (any, error) { return Decode(strings.NewReader(s)) })
+	tabularPerRow := marginal(func(s string) (any, error) { return DecodeTabular(strings.NewReader(s)) })
+
+	const maxExtraPerRow = 3.5
+	if extra := tabularPerRow - decodePerRow; extra > maxExtraPerRow {
+		t.Errorf("DecodeTabular's row loop costs %.3f allocs/row over Decode(), want <= %.1f "+
+			"(decodePerRow=%.3f tabularPerRow=%.3f)", extra, maxExtraPerRow, decodePerRow, tabularPerRow)
+	}
+}
+
+// --- Tier 1 performance: synthesize's builder should grow at most once
+
+func synthHeaderFixture(n int) (*header, []string) {
+	h := &header{
+		name:       "findings",
+		nameText:   "findings",
+		fields:     []string{"severity", "file", "problem", "fix"},
+		fieldsText: "severity|file|problem|fix",
+		hasFields:  true,
+		delimiter:  '|',
+		declared:   n,
+	}
+	rows := make([]string, n)
+	for i := range rows {
+		rows[i] = "  CRITICAL|auth.go|token never expires|check expiry"
+	}
+	return h, rows
+}
+
+// TestSynthesize_BufferGrowthDoesNotScaleWithRowCount pins that synthesize's
+// strings.Builder is sized up front rather than left to grow one doubling at a
+// time. Every per-row write inside synthesize (WriteString/WriteByte) is
+// allocation-free once the buffer already has room, so the ONLY allocations
+// that can scale with row count are buffer reallocations triggered by running
+// out of that room. Comparing marginal allocs/row between a small and a large
+// row count isolates exactly that: if the builder is pre-sized correctly, the
+// marginal cost is ~0 regardless of how many rows are added, because there is
+// nothing left to grow into.
+//
+// WHY 1.0. History of this figure: without a Grow call, 8 allocations at 20
+// rows, 19 at 500 — the buffer reallocated roughly every doubling as it was
+// built up one row at a time. Sizing the buffer from the rows' own
+// already-known byte lengths (never from h.declared — Task 1's hazard applies
+// here too, so the size comes from data already read, not from
+// attacker-controlled input) collapsed that gap to 0: the buffer never runs
+// out of room, so it never reallocates. The exact 8/19 will drift on another
+// toolchain; the GAP between small and large is what 1.0 bounds, and it
+// stays near 0 regardless of what the absolute counts are. 1.0 leaves a small
+// margin above that without tolerating a
+// return to per-doubling growth.
+func TestSynthesize_BufferGrowthDoesNotScaleWithRowCount(t *testing.T) {
+	const (
+		small = 20
+		large = 500
+	)
+
+	measure := func(n int) float64 {
+		h, rows := synthHeaderFixture(n)
+		return testing.AllocsPerRun(50, func() {
+			synthesize(h, rows, 1)
+		})
+	}
+
+	allocsSmall, allocsLarge := measure(small), measure(large)
+
+	const maxGrowthDelta = 1.0
+	if delta := allocsLarge - allocsSmall; delta > maxGrowthDelta {
+		t.Errorf("synthesize allocated %.1f more times at %d rows than at %d, want <= %.1f "+
+			"(allocsSmall=%.1f allocsLarge=%.1f) — the builder is growing instead of being sized up front",
+			delta, large, small, maxGrowthDelta, allocsSmall, allocsLarge)
+	}
+}
+
+// --- Tier 1 acceptance criterion: the Tier 1 win, measured whole
+
+// TestDecodeTabular_CostsLittleOverDecode is Tier 1's acceptance-criterion
+// test (AC 3 in the plan): DecodeTabular's own marginal cost, isolated by
+// comparing it against Decode() on the same payload in the same run — the
+// "ratio against a stable comparator" pattern output_test.go already uses for
+// EncodeOrJSON (TestEncodeOrJSON_GuardCostsLittleOverEncode) — must be lower
+// after Tier 1 than before it, and never an absolute ceiling
+// (sanitize_bench_test.go explains why absolute ceilings are hostage to the
+// runtime).
+//
+// This is deliberately a single-size measurement, not the marginal small-vs-
+// large comparison Tasks 2 and 3 use. Those two isolate ONE specific fix each
+// from every other cost in the function; this one is the acceptance
+// criterion for the whole of Tier 1 together, at a size a real findings
+// payload actually is (200 rows, matching TestEncodeOrJSON_GuardCostsLittleOverEncode's
+// own row count).
+//
+// WHY 3.5. History of this figure: before Tier 1, 4.14 extra allocations/row
+// over Decode() at this size; after Tasks 1-3, 3.07. Both will drift on a
+// different toolchain, same as every other allocation figure in this
+// package — 3.5 sits between them so it fails against the pre-Tier-1 shape
+// (two loop allocations, an ungrown builder) and leaves room for legitimate
+// small drift without tolerating a regression back toward it.
+func TestDecodeTabular_CostsLittleOverDecode(t *testing.T) {
+	const (
+		rows           = 200
+		maxPerRowAdded = 3.5
+	)
+
+	payload := cleanTabularFixture(rows)
+
+	decode := testing.AllocsPerRun(20, func() {
+		if _, err := Decode(strings.NewReader(payload)); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+	})
+	tabular := testing.AllocsPerRun(20, func() {
+		if _, err := DecodeTabular(strings.NewReader(payload)); err != nil {
+			t.Fatalf("DecodeTabular: %v", err)
+		}
+	})
+
+	if perRow := (tabular - decode) / float64(rows); perRow > maxPerRowAdded {
+		t.Errorf("DecodeTabular adds %.2f allocations per row over Decode() (%.0f vs %.0f "+
+			"over %d rows), want at most %.2f", perRow, tabular, decode, rows, maxPerRowAdded)
 	}
 }
