@@ -27,7 +27,12 @@ func TestPreallocRowCapacity(t *testing.T) {
 	}{
 		{"typical small count is used as-is", 3, 3},
 		{"zero is used as-is", 0, 0},
-		{"a huge declared count is capped", 999999999999, maxPreallocRows},
+		// A 12-digit value here would overflow a 32-bit int at compile time — this
+		// package has no 32-bit build target today, but a test fixture should not
+		// be the thing that decides that. 999999999 (9 nines) clears
+		// maxPreallocRows by five orders of magnitude while staying under
+		// math.MaxInt32 (~2.147 billion).
+		{"a huge declared count is capped", 999999999, maxPreallocRows},
 		{"exactly at the cap is used as-is", maxPreallocRows, maxPreallocRows},
 		{"one past the cap is capped", maxPreallocRows + 1, maxPreallocRows},
 		{"a malformed negative count clamps to zero", -5, 0},
@@ -49,12 +54,16 @@ func TestDecodeTabular_HugeDeclaredCountDoesNotChangeBehavior(t *testing.T) {
 	// same shape, taken to an extreme. This must still succeed, and Declared must
 	// still report the number exactly as written, proving the capacity cap only
 	// bounds the internal preallocation and never the reported/observable value.
-	doc, err := DecodeTabular(strings.NewReader("findings[999999999999|]{a}:\n"))
+	// 999999999 (not a 12-digit value): parseHeader reads this through
+	// strconv.Atoi, which returns ErrRange past math.MaxInt32 on a 32-bit build.
+	// A fixture that overflows there would fail this test for a portability
+	// reason unrelated to what it verifies.
+	doc, err := DecodeTabular(strings.NewReader("findings[999999999|]{a}:\n"))
 	if err != nil {
 		t.Fatalf("a huge declared count with zero physical rows must still decode: %v", err)
 	}
-	if doc.Declared != 999999999999 {
-		t.Errorf("Declared = %d, want 999999999999", doc.Declared)
+	if doc.Declared != 999999999 {
+		t.Errorf("Declared = %d, want 999999999", doc.Declared)
 	}
 	if len(doc.Rows) != 0 {
 		t.Errorf("Rows = %d, want 0", len(doc.Rows))

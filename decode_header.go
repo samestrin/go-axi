@@ -78,6 +78,16 @@ func parseHeader(line string, lineNo int) (*header, error) {
 	if err != nil {
 		return nil, fmt.Errorf("toon: line %d: %q is not a row count in %q", lineNo, digits, line)
 	}
+	// strconv.Atoi accepts a leading '-', so a header like `findings[-5|]{a}:`
+	// produces a NEGATIVE h.declared here rather than a parse error. That is
+	// intentional and pre-existing: DecodeTabular's row-count gate already
+	// rejects it downstream ("declares -5 row(s) but the payload carries 0"),
+	// and pinning that error at ITS current site (rather than moving the
+	// rejection here) keeps this change from being a Tier 1 performance PR
+	// that quietly also changes a header-parse error message. Any future code
+	// that sizes something off h.declared must go through preallocRowCapacity
+	// (decode.go) — the one place already built to clamp this — rather than
+	// re-deriving its own negative check.
 	h.declared = count
 
 	// TOON defines exactly three delimiters. The old reader accepted any

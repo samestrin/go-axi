@@ -374,14 +374,17 @@ func cleanTabularFixture(n int) string {
 // walks the same rows through the same decoder, so it moves in step with any
 // runtime or toon-go change; only DecodeTabular's OWN extra cost is pinned.
 //
-// WHY 3.5. Measured today: raw := sc.Text() allocates a fresh string every
-// row, and "  "+strings.TrimLeft(raw, " \t") allocates again for the
+// WHY 3.5. History of this figure: raw := sc.Text() allocated a fresh string
+// every row, and "  "+strings.TrimLeft(raw, " \t") allocated again for the
 // reindent — two allocations per row on top of whatever Decode() already
-// pays, measured at 4.01/row (small=20, large=500, on this fixture, this
-// toolchain). Replacing sc.Text() with sc.Bytes()+bytes.TrimLeft folds the
-// reindent into a single allocation, which measured at ~3.0/row after the
-// fix. 3.5 sits between the two: it fails today and leaves room below it for
-// legitimate small drift, while still catching a regression back to two loop
+// pays, measured at 4.01/row (small=20, large=500, on this fixture, on the
+// toolchain this was written against). Replacing sc.Text() with
+// sc.Bytes()+bytes.TrimLeft folded the reindent into a single allocation,
+// measured at ~3.0/row after the fix. Both numbers will drift on a different
+// toolchain — the DIFFERENCE they establish is what the threshold protects:
+// 3.5 sits between them, so it fails a two-allocation loop and leaves room
+// below it for legitimate small drift, while still catching a regression back
+// to two loop
 // allocations.
 func TestDecodeTabular_RowLoopAllocatesOncePerRow(t *testing.T) {
 	const (
@@ -443,13 +446,16 @@ func synthHeaderFixture(n int) (*header, []string) {
 // marginal cost is ~0 regardless of how many rows are added, because there is
 // nothing left to grow into.
 //
-// WHY 1.0. Measured today (no Grow call): 8 allocations at 20 rows, 19 at 500
-// — the buffer reallocates roughly every doubling as it's built up one row at
-// a time. After sizing the buffer from the rows' own already-known byte
-// lengths (never from h.declared — Task 1's hazard applies here too, so the
-// size comes from data already read, not from attacker-controlled input),
-// that gap collapses to 0: the buffer never runs out of room, so it never
-// reallocates. 1.0 leaves a small margin above that without tolerating a
+// WHY 1.0. History of this figure: without a Grow call, 8 allocations at 20
+// rows, 19 at 500 — the buffer reallocated roughly every doubling as it was
+// built up one row at a time. Sizing the buffer from the rows' own
+// already-known byte lengths (never from h.declared — Task 1's hazard applies
+// here too, so the size comes from data already read, not from
+// attacker-controlled input) collapsed that gap to 0: the buffer never runs
+// out of room, so it never reallocates. The exact 8/19 will drift on another
+// toolchain; the GAP between small and large is what 1.0 bounds, and it
+// stays near 0 regardless of what the absolute counts are. 1.0 leaves a small
+// margin above that without tolerating a
 // return to per-doubling growth.
 func TestSynthesize_BufferGrowthDoesNotScaleWithRowCount(t *testing.T) {
 	const (
@@ -492,10 +498,12 @@ func TestSynthesize_BufferGrowthDoesNotScaleWithRowCount(t *testing.T) {
 // payload actually is (200 rows, matching TestEncodeOrJSON_GuardCostsLittleOverEncode's
 // own row count).
 //
-// WHY 3.5. Before Tier 1: 4.14 extra allocations/row over Decode() at this
-// size. After Tasks 1-3: 3.07. 3.5 sits between the two — it fails against
-// the pre-Tier-1 code and leaves room for legitimate small drift without
-// tolerating a regression back toward the original cost.
+// WHY 3.5. History of this figure: before Tier 1, 4.14 extra allocations/row
+// over Decode() at this size; after Tasks 1-3, 3.07. Both will drift on a
+// different toolchain, same as every other allocation figure in this
+// package — 3.5 sits between them so it fails against the pre-Tier-1 shape
+// (two loop allocations, an ungrown builder) and leaves room for legitimate
+// small drift without tolerating a regression back toward it.
 func TestDecodeTabular_CostsLittleOverDecode(t *testing.T) {
 	const (
 		rows           = 200
