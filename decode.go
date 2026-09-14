@@ -97,6 +97,33 @@ const maxLine = 8 * 1024 * 1024
 // findings payload (hundreds of rows of KB-scale text) and far below trouble.
 const MaxDocumentBytes = 64 * 1024 * 1024
 
+// maxPreallocRows bounds how many rows DecodeTabular will preallocate for
+// up front, based on the header's declared count.
+//
+// The declared count is attacker-controlled: it comes from the document
+// itself, before a single row has been read. Sizing a slice directly off it
+// would let a header like `findings[999999999999|]{a}:` reserve room for a
+// trillion rows before the reader has any evidence the document carries more
+// than zero. 4096 comfortably covers any real findings payload (hundreds of
+// rows) with room to spare; a document declaring more than that just grows
+// the slice the normal way past this point, which is the behavior every
+// caller already gets today.
+const maxPreallocRows = 4096
+
+// preallocRowCapacity turns a header's declared row count into a safe
+// capacity hint: never negative (a malformed header can produce one — see
+// TestDecodeTabular_NegativeDeclaredCountDoesNotPanic), and never past
+// maxPreallocRows regardless of what the header claims.
+func preallocRowCapacity(declared int) int {
+	if declared < 0 {
+		return 0
+	}
+	if declared > maxPreallocRows {
+		return maxPreallocRows
+	}
+	return declared
+}
+
 // DecodeTabular reads one TOON tabular array from r.
 func DecodeTabular(r io.Reader) (*Document, error) {
 	sc := bufio.NewScanner(r)
@@ -141,7 +168,7 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 	// swallows both and reports a column-count mismatch on real CLI output —
 	// which is what this package did until it was run against the binary rather
 	// than against the encoder's golden fixture.
-	var rows []string
+	rows := make([]string, 0, preallocRowCapacity(h.declared))
 	for sc.Scan() {
 		line++
 		raw := sc.Text()
