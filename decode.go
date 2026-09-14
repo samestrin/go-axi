@@ -219,6 +219,25 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 			h.declared, len(rows))
 	}
 
+	out, ok := decodeRowsFast(h, rows)
+	if !ok {
+		var err error
+		out, err = decodeRowsGeneric(h, rows, headerAt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	doc.Rows = out
+	return doc, nil
+}
+
+// decodeRowsGeneric decodes rows through toon-go's generic decoder: it
+// synthesizes a single-array document, decodes it, and projects each value
+// back to a string. This was DecodeTabular's only row-decode path before
+// decodeRowsFast existed, and it remains the correctness reference the fast
+// path is checked against — untouched behavior, just given a name so both
+// paths can be called and compared directly on the same (h, rows) input.
+func decodeRowsGeneric(h *header, rows []string, headerAt int) ([]map[string]string, error) {
 	decoded, err := toon.DecodeString(synthesize(h, rows, headerAt))
 	if err != nil {
 		return nil, fmt.Errorf("toon: %w", err)
@@ -228,22 +247,23 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 	if err != nil {
 		return nil, err
 	}
+	var out []map[string]string
 	for i, v := range values {
 		row, ok := v.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("toon: row %d is %T, not a record", i+1, v)
 		}
-		out := make(map[string]string, len(row))
+		rowOut := make(map[string]string, len(row))
 		for k, raw := range row {
 			s, err := projectValue(raw)
 			if err != nil {
 				return nil, fmt.Errorf("toon: row %d, field %q: %w", i+1, k, err)
 			}
-			out[k] = s
+			rowOut[k] = s
 		}
-		doc.Rows = append(doc.Rows, out)
+		out = append(out, rowOut)
 	}
-	return doc, nil
+	return out, nil
 }
 
 // synthesize builds the canonical single-array document handed to toon-go.
