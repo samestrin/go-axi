@@ -255,13 +255,36 @@ func DecodeTabular(r io.Reader) (*Document, error) {
 // TestABlankLineBetweenRowsShiftsReportedLineNumbers pins the real behaviour.
 func synthesize(h *header, rows []string, headerAt int) string {
 	var b strings.Builder
+	// Computed once and reused for both sizing and writing below: strconv.Itoa
+	// only allocates past its small-integer cache (0-99), so calling it twice
+	// would cost a second allocation for any row count of 100 or more.
+	rowCount := strconv.Itoa(len(rows))
+	delim := delimiterSuffix(h.delimiter)
+
+	// Grow once, sized off the rows ALREADY READ rather than h.declared: the
+	// declared count is attacker-controlled (Task 1's hazard applies here too),
+	// but by this point every row's actual byte length is already known, so
+	// there is no untrusted number left to size off.
+	size := headerAt - 1        // leading blank lines
+	size += len(h.nameText) + 1 // '['
+	size += len(rowCount)
+	size += len(delim)
+	size++ // ']'
+	if h.hasFields {
+		size += len(h.fieldsText) + 2 // '{' fields '}'
+	}
+	size += 2 // ":\n"
+	for _, r := range rows {
+		size += len(r) + 1 // row + '\n'
+	}
+	b.Grow(size)
 	for i := 1; i < headerAt; i++ {
 		b.WriteByte('\n')
 	}
 	b.WriteString(h.nameText)
 	b.WriteByte('[')
-	b.WriteString(strconv.Itoa(len(rows)))
-	b.WriteString(delimiterSuffix(h.delimiter))
+	b.WriteString(rowCount)
+	b.WriteString(delim)
 	b.WriteByte(']')
 	if h.hasFields {
 		b.WriteByte('{')
