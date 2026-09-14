@@ -1,6 +1,7 @@
 package goaxi
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -332,5 +333,83 @@ func TestHeaderlessPayloadIsStillAnError(t *testing.T) {
 	// toon-go also returns (nil, nil) for a bare indented line with no header.
 	if _, err := DecodeTabular(strings.NewReader("  just|a|row\n")); err == nil {
 		t.Fatal("a headerless payload decoded cleanly")
+	}
+}
+
+// --- Tier 1 performance: the row loop's own marginal cost per row
+
+// cleanTabularFixture builds a clean (no quoting, no escaping needed) tabular
+// payload of exactly n rows, so the row loop never takes the TrimLeft/quote
+// slow paths — this isolates the loop's OWN allocation cost from decisions
+// made elsewhere in the row.
+func cleanTabularFixture(n int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "findings[%d|]{severity|file|problem|fix}:\n", n)
+	for i := 0; i < n; i++ {
+		b.WriteString("  CRITICAL|auth.go|token never expires|check expiry\n")
+	}
+	return b.String()
+}
+
+// TestDecodeTabular_RowLoopAllocatesOncePerRow isolates DecodeTabular's row-copy
+// loop from every other cost in the function (header parse, synthesize, and
+// toon-go's own generic decode of each row) by comparing its MARGINAL
+// allocations-per-row against Decode()'s marginal allocations-per-row on the
+// SAME payload. Decode() reads the identical tabular text but never re-scans or
+// re-indents a row, so its per-row cost is toon-go's generic decoder alone —
+// the exact cost DecodeTabular pays too, on top of its own loop. The
+// difference between the two, per row, isolates the loop.
+//
+// WHY marginal (small vs large), not a single measurement. A single
+// AllocsPerRun on n rows divided by n mixes in the one-time header/synthesize
+// cost, which shrinks toward zero as n grows and would make the "per row"
+// number drift with fixture size rather than measure a constant. Comparing
+// two sizes and dividing by the row DELTA cancels every fixed cost, leaving
+// only what scales with rows — exactly the row loop.
+//
+// WHY a ratio against Decode() as the comparator, not a fixed ceiling
+// (sanitize_bench_test.go, TestSanitize_CleanPayloadDoesNotPayToBeCopied,
+// explains why: an absolute ceiling is hostage to the runtime and to
+// toon-go's own internals, neither of which this package controls). Decode()
+// walks the same rows through the same decoder, so it moves in step with any
+// runtime or toon-go change; only DecodeTabular's OWN extra cost is pinned.
+//
+// WHY 3.5. Measured today: raw := sc.Text() allocates a fresh string every
+// row, and "  "+strings.TrimLeft(raw, " \t") allocates again for the
+// reindent — two allocations per row on top of whatever Decode() already
+// pays, measured at 4.01/row (small=20, large=500, on this fixture, this
+// toolchain). Replacing sc.Text() with sc.Bytes()+bytes.TrimLeft folds the
+// reindent into a single allocation, which measured at ~3.0/row after the
+// fix. 3.5 sits between the two: it fails today and leaves room below it for
+// legitimate small drift, while still catching a regression back to two loop
+// allocations.
+func TestDecodeTabular_RowLoopAllocatesOncePerRow(t *testing.T) {
+	const (
+		small = 20
+		large = 500
+	)
+
+	marginal := func(fn func(string) (any, error)) float64 {
+		measure := func(n int) float64 {
+			payload := cleanTabularFixture(n)
+			if _, err := fn(payload); err != nil {
+				t.Fatalf("fixture must decode without error: %v", err)
+			}
+			return testing.AllocsPerRun(50, func() {
+				if _, err := fn(payload); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+		return (measure(large) - measure(small)) / float64(large-small)
+	}
+
+	decodePerRow := marginal(func(s string) (any, error) { return Decode(strings.NewReader(s)) })
+	tabularPerRow := marginal(func(s string) (any, error) { return DecodeTabular(strings.NewReader(s)) })
+
+	const maxExtraPerRow = 3.5
+	if extra := tabularPerRow - decodePerRow; extra > maxExtraPerRow {
+		t.Errorf("DecodeTabular's row loop costs %.3f allocs/row over Decode(), want <= %.1f "+
+			"(decodePerRow=%.3f tabularPerRow=%.3f)", extra, maxExtraPerRow, decodePerRow, tabularPerRow)
 	}
 }
