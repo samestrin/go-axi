@@ -5,8 +5,11 @@
 # Usage: benchgate.sh <base-profile> <head-profile>
 #
 # Both arguments are `go test -bench` output files. The comparison is A/B on one
-# machine — base and head are measured back to back on the same runner — rather
-# than against a committed baseline. Committed baselines do not survive a shared
+# machine — base and head are compiled first, then measured ALTERNATELY on the
+# same runner, so neither side owns a contiguous block of time that interference
+# could skew on its own — rather than against a committed baseline. See the
+# TIME_THRESHOLD note below for what happened when they were not interleaved.
+# Committed baselines do not survive a shared
 # CI fleet: GitHub rotates runner hardware, so an absolute number recorded on one
 # generation fails on the next for reasons that have nothing to do with the diff.
 # The README's published figures are Apple M5 and are not reproducible in CI at
@@ -23,10 +26,25 @@ BASE=${1:?usage: benchgate.sh <base-profile> <head-profile>}
 HEAD=${2:?usage: benchgate.sh <base-profile> <head-profile>}
 
 # A significant wall-time regression beyond this percentage fails the build.
-# Deliberately loose. Timing spread on a quiet M5 reached 21% on EncodeOrJSON and
-# 13% on EncodeChecked; a shared runner is worse. Tightening this buys flakes,
-# not sensitivity — the p-value is what actually separates signal from noise.
-TIME_THRESHOLD=${TIME_THRESHOLD:-10}
+#
+# Deliberately loose, and raised from 10 after 10 proved to be BELOW the noise
+# floor of a shared runner. The p-value alone does not save it: benchstat asks
+# whether two sample sets differ, and when interference covers one side's whole
+# measurement block the two sets genuinely do differ — significantly, and for
+# reasons that have nothing to do with the diff. PR #17 changed no encode path
+# and still failed three TabularHeader benchmarks together at +17.95%, +17.79%
+# and +10.65%; a re-run of the same commit put them at +1.97% and +1.90%.
+#
+# The workflow now alternates base and head rather than measuring each in one
+# block, which is the real fix — it denies interference the chance to land on
+# one side only. This threshold is the margin left over, set above the worst
+# false positive observed rather than below it. Timing spread on a QUIET M5
+# already reached 21% on EncodeOrJSON and 13% on EncodeChecked, so anything
+# tighter buys flakes, not sensitivity.
+#
+# What still catches a real regression: it has to survive interleaving, which
+# means it has to be present in every round rather than in one unlucky window.
+TIME_THRESHOLD=${TIME_THRESHOLD:-15}
 
 # Allocations are deterministic: every allocs/op row measures at CI 0%. So any
 # significant increase is real, and the threshold is zero. This is the gate that

@@ -81,19 +81,40 @@ jobs:
         # verdict on an unrelated pull request.
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
 
+      # Both sides are COMPILED first and measured afterwards, alternating, so a
+      # noisy stretch of runner time cannot land on one side only.
+      #
+      # This replaced "measure all of head, then check out base and measure all
+      # of base". That shape puts each side in its own contiguous block, so any
+      # interference — a co-tenant VM, a throttle, a migration — skews every
+      # benchmark in whichever block it overlapped, all at once. Observed on PR
+      # #17, which changed no encode path at all: one run failed three
+      # benchmarks together (TabularHeader at +17.95%, +17.79% and +10.65%, all
+      # the largest sizes) and a re-run of the SAME commit put the same
+      # benchmarks at +1.97% and +1.90%. Correlated failures are the signature
+      # of a noisy period, not of a slow change.
+      - name: Compile both sides
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          go test -c -o /tmp/head.test .
+          git checkout --detach ${{ github.event.pull_request.base.sha }}
+          go test -c -o /tmp/base.test .
+          git checkout --detach "$HEAD_SHA"
+
       # count=6 matches the README's "medians of six runs" and is the floor
       # benchstat needs: at count=3 it refuses a confidence interval, and it
       # wants >= 4 samples before it will call a difference significant at all.
+      # Six rounds of count=1, alternating, produce the same six samples per
+      # side at the same total cost — they are just no longer contiguous.
       # benchtime=100ms keeps the whole job near a minute.
-      - name: Benchmark this branch
-        run: go test -run='^$' -bench=. -benchtime=100ms -count=6 . > /tmp/head.txt
-
-      - name: Benchmark the base commit
+      - name: Measure, alternating base and head
         run: |
-          HEAD_SHA=$(git rev-parse HEAD)
-          git checkout --detach ${{ github.event.pull_request.base.sha }}
-          go test -run='^$' -bench=. -benchtime=100ms -count=6 . > /tmp/base.txt
-          git checkout --detach "$HEAD_SHA"
+          : > /tmp/base.txt
+          : > /tmp/head.txt
+          for i in 1 2 3 4 5 6; do
+            /tmp/base.test -test.run='^$' -test.bench=. -test.benchtime=100ms -test.count=1 >> /tmp/base.txt
+            /tmp/head.test -test.run='^$' -test.bench=. -test.benchtime=100ms -test.count=1 >> /tmp/head.txt
+          done
 
       - name: Enforce no regression
         run: bash .github/benchgate.sh /tmp/base.txt /tmp/head.txt
