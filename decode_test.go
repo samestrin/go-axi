@@ -413,3 +413,63 @@ func TestDecodeTabular_RowLoopAllocatesOncePerRow(t *testing.T) {
 			"(decodePerRow=%.3f tabularPerRow=%.3f)", extra, maxExtraPerRow, decodePerRow, tabularPerRow)
 	}
 }
+
+// --- Tier 1 performance: synthesize's builder should grow at most once
+
+func synthHeaderFixture(n int) (*header, []string) {
+	h := &header{
+		name:       "findings",
+		nameText:   "findings",
+		fields:     []string{"severity", "file", "problem", "fix"},
+		fieldsText: "severity|file|problem|fix",
+		hasFields:  true,
+		delimiter:  '|',
+		declared:   n,
+	}
+	rows := make([]string, n)
+	for i := range rows {
+		rows[i] = "  CRITICAL|auth.go|token never expires|check expiry"
+	}
+	return h, rows
+}
+
+// TestSynthesize_BufferGrowthDoesNotScaleWithRowCount pins that synthesize's
+// strings.Builder is sized up front rather than left to grow one doubling at a
+// time. Every per-row write inside synthesize (WriteString/WriteByte) is
+// allocation-free once the buffer already has room, so the ONLY allocations
+// that can scale with row count are buffer reallocations triggered by running
+// out of that room. Comparing marginal allocs/row between a small and a large
+// row count isolates exactly that: if the builder is pre-sized correctly, the
+// marginal cost is ~0 regardless of how many rows are added, because there is
+// nothing left to grow into.
+//
+// WHY 1.0. Measured today (no Grow call): 8 allocations at 20 rows, 19 at 500
+// — the buffer reallocates roughly every doubling as it's built up one row at
+// a time. After sizing the buffer from the rows' own already-known byte
+// lengths (never from h.declared — Task 1's hazard applies here too, so the
+// size comes from data already read, not from attacker-controlled input),
+// that gap collapses to 0: the buffer never runs out of room, so it never
+// reallocates. 1.0 leaves a small margin above that without tolerating a
+// return to per-doubling growth.
+func TestSynthesize_BufferGrowthDoesNotScaleWithRowCount(t *testing.T) {
+	const (
+		small = 20
+		large = 500
+	)
+
+	measure := func(n int) float64 {
+		h, rows := synthHeaderFixture(n)
+		return testing.AllocsPerRun(50, func() {
+			synthesize(h, rows, 1)
+		})
+	}
+
+	allocsSmall, allocsLarge := measure(small), measure(large)
+
+	const maxGrowthDelta = 1.0
+	if delta := allocsLarge - allocsSmall; delta > maxGrowthDelta {
+		t.Errorf("synthesize allocated %.1f more times at %d rows than at %d, want <= %.1f "+
+			"(allocsSmall=%.1f allocsLarge=%.1f) — the builder is growing instead of being sized up front",
+			delta, large, small, maxGrowthDelta, allocsSmall, allocsLarge)
+	}
+}
