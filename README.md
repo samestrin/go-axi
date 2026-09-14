@@ -115,6 +115,37 @@ Projection is not free. Medians of six runs on a 500-row payload, Apple M5:
 
 Reproduce with `go test -run '^$' -bench Format_Encode -benchmem`. That is about 2.6× the time and 2.8× the allocations, so `Encode` stays the fast path and the default. Projection applies to TOON only — `encoding/json` already reads the `json` tag, so a JSON payload is passed straight through.
 
+### Reading TOON back
+
+| Function | Behavior |
+|---|---|
+| `Decode(r io.Reader) (any, error)` | Read a whole TOON document of any shape, preserving toon-go's types |
+| `DecodeFile(path string) (any, error)` | Same, from a file, naming it on error |
+| `DecodeTabular(r io.Reader) (*Document, error)` | Read ONE tabular array, keeping its declared field order, delimiter and row count |
+| `DecodeTabularFile(path string) (*Document, error)` | Same, from a file |
+| `IsTabularHeader(line string) bool` | Does this line open a tabular array? The dispatch point between the two |
+
+`Decode` forwards to toon-go, so there is one decoder rather than two. It refuses an empty document, because toon-go reports one as a non-nil empty container and a caller cannot tell that from real data.
+
+**`DecodeTabular` exists because a tabular array declares three things about itself that toon-go's public API cannot give back.** It decodes in one strict pass and returns a map, and its `parsedHeader` type is unexported — so the declared field ORDER, the delimiter, and the declared row count are all unreachable. Three of its rules also make the strict pass unusable on real CLI output: an explicitly written comma delimiter is rejected outright, a trailing block declaring more rows than it carries fails the whole document, and a row count disagreeing with the physical rows is an error in either direction.
+
+That last one is not a defect to route around — it is load-bearing. A paginated payload caps the rows it emits while keeping the true total in the header, and says so with a `truncated` sibling. So `DecodeTabular` reads the header itself, collects the rows belonging to that array, and hands toon-go a synthesized document carrying the physical count. Strict mode stays on, which keeps toon-go's row-width gate. `Document.Declared` and `len(Document.Rows)` are both returned and the caller decides:
+
+```go
+doc, err := goaxi.DecodeTabularFile("findings.axi")
+if err != nil {
+    return err
+}
+for _, row := range doc.Rows {         // map[string]string, keyed by field name
+    fmt.Println(row[doc.Fields[0]])    // Fields is order-bearing, Rows is not
+}
+if len(doc.Rows) < doc.Declared {
+    fmt.Printf("showing %d of %d\n", len(doc.Rows), doc.Declared)
+}
+```
+
+More rows than declared is still refused — that is a disagreement no contract allows.
+
 ### Catching a missing `toon` tag
 
 | Function | Behavior |
@@ -264,7 +295,7 @@ It compares two commits rather than checking against a stored baseline, because 
 
 ## What this adds to toon-go
 
-`toon-go` is a good codec. Use it directly for encoding and decoding. These are the gaps a production CLI hits:
+`toon-go` is a good codec. Use it directly for encoding, and `Decode` here forwards straight to it for reading. These are the gaps a production CLI hits:
 
 | Gap in toon-go | What happens without a guard | go-axi |
 |---|---|---|
@@ -273,6 +304,7 @@ It compares two commits rather than checking against a stored baseline, because 
 | Reference cycles reach the encoder | Stack exhaustion kills the process; `recover()` cannot catch it | `Sanitize`, `Check` |
 | Size relative to JSON is not reported | A command pays more tokens as TOON than it would as JSON | `Check.Efficient` |
 | Exit codes and `help[]` formatting are out of scope | Every tool invents its own, and they drift | Exported constants, `WriteHelp` |
+| A tabular array's field order, delimiter and declared row count are unreachable — `parsedHeader` is unexported — and a paginated payload fails the strict pass outright | A reader hardcodes `\|`, keys consumers on quoted field names, or cannot read paginated output at all | `DecodeTabular` |
 
 The `help[]` form is the inline TOON array, because it is the only one in circulation that survives its own codec: the AXI specification's indented example fails to decode with "list length mismatch", and the `help[] line` form fails with "missing colon after key".
 

@@ -124,6 +124,13 @@ var bracedFieldList = []byte("]{")
 // decides when running it can be skipped, so the two cannot drift apart —
 // TestIsTabularHeader_AgreesWithTheRegexp pins the equivalence anyway.
 //
+// DISTINCT from the exported IsTabularHeader in decode_header.go, deliberately.
+// That one tests ONE line for the shape that opens a tabular array, on the
+// reading path, and accepts the empty `findings[0]:` form. This one scans a
+// WHOLE encoded document and requires the braced field list, because an empty
+// array is not the shape the tier describes. See that function for the full
+// reason the two stay apart.
+//
 // WHY THE SKIP EARNS ITS PLACE, measured rather than assumed. The engine is
 // cheap on tabular output — 526ns at 2000 rows, against roughly 1,043,000ns to
 // encode the same payload, so 0.05% and not worth a line of code. It is the
