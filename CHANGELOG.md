@@ -4,6 +4,26 @@ All notable changes to this project are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major version is 0 the API is not frozen.
 
+## [v0.3.0] - 2026-09-14
+
+Minor rather than patch because the API grows in three directions. Nothing is removed and no signature changes, so upgrading from v0.2.1 cannot produce a compile error.
+
+### Added
+
+- A decode side. `Decode` reads a whole TOON document of any shape and forwards to toon-go, so there is one decoder rather than two; it adds only an empty-document guard, because toon-go reports an empty document as a non-nil EMPTY container that a caller cannot distinguish from real data. `DecodeFile` is the same from a path.
+- `DecodeTabular` and `DecodeTabularFile`, which read ONE tabular array and return the three things toon-go's public API cannot give back: the declared field ORDER, the delimiter, and the declared row count. Its `parsedHeader` type is unexported and it decodes to a map, so all three are unreachable. Three of its strict-pass rules also make it unusable on real CLI output — an explicitly written comma delimiter is rejected outright, a trailing block declaring more rows than it carries fails the whole document, and a row count disagreeing with the physical rows is an error in either direction. That last rule matters: a paginated payload declares the true total while emitting fewer rows on purpose. `Document.Declared` and `len(Document.Rows)` are both returned and the caller decides. More rows than declared is still refused.
+- `IsTabularHeader`, the dispatch point between the two readers. It tests one line for the shape that opens a tabular array and deliberately does NOT validate, so a BROKEN tabular header stays on the tabular path and reports its real problem instead of being rerouted to the document reader and silently losing a column.
+- `Format`, `ParseFormat`, `Format.Encode` and `Format.EncodeProjected`, so a command supporting `--toon` and `--json` carries the choice as a value rather than branching at every call site. `EncodeProjected` routes through the JSON form so one tag set drives both output shapes, at roughly 2.6x the time and 2.8x the allocations of `Encode` on a 500-row payload. `Encode` stays the default. Projection is TOON-only, because `encoding/json` already reads the `json` tag.
+- `CheckTags` and `TagVerdict`, which find a field missing a `toon` tag. toon-go does not fall back to the `json` tag, and a missing tag does not error and is not empty — it silently publishes Go identifiers as the column contract, which is exactly what breaks an instruction like "the third column is SEVERITY". 368 ns, zero allocations, intended for a test over every type a command prints.
+
+### Changed
+
+- The package documentation no longer says toon-go's decoding is out of scope, because `Decode` now forwards to it and `DecodeTabular` covers the tabular header it cannot expose.
+
+### Development
+
+- A benchmark gate runs on every pull request. It measures the base commit and the branch back to back on one runner rather than against a committed baseline, because GitHub rotates runner hardware and an absolute number recorded on one generation fails on the next for reasons unrelated to the change. Allocations fail at any significant increase, which is what protects the "one allocation regardless of size" guarantee; wall time fails past 10%; `B/op` is reported and not gated. The gate reports how many measurements it compared and fails at zero, so a run that parsed nothing cannot be read as a pass.
+
 ## [v0.2.1] - 2026-09-13
 
 Performance only. No API change, and no observable behaviour change: the string cleaner was checked against the implementation it replaces over 200,000 random inputs including invalid UTF-8 and is byte-identical on every one, and tabular-header detection is unchanged because the regexp that defines it still decides every case.
@@ -101,6 +121,7 @@ First tagged release. Not a codec: toon-go encodes and decodes, and this is the 
 - `WriteHelp`, the one `help[]` form that survives its own codec.
 - `ExitCode`, one 0-4 set, as constants rather than prose in a style guide.
 
+[v0.3.0]: https://github.com/samestrin/go-axi/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/samestrin/go-axi/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/samestrin/go-axi/compare/v0.1.4...v0.2.0
 [v0.1.4]: https://github.com/samestrin/go-axi/compare/v0.1.3...v0.1.4
