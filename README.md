@@ -289,7 +289,7 @@ Two of those are worth calling out. Sanitizing a payload that needs no cleaning 
 
 What remains is dominated by `toon.Marshal` itself, not by this layer.
 
-These figures are enforced, not merely recorded. Every pull request measures the base commit and the branch back to back on one runner, and fails if a benchmark regresses: wall time by more than 10%, allocations by any amount at all. The gate is [`.github/benchgate.sh`](.github/benchgate.sh).
+These figures are enforced, not merely recorded. Every pull request compiles the base commit and the branch, measures them **alternately** on one runner, and fails if a benchmark regresses: wall time by more than 15%, allocations by any amount at all. The gate is [`.github/benchgate.sh`](.github/benchgate.sh).
 
 It compares two commits rather than checking against a stored baseline, because the numbers above are Apple M5 figures that a shared CI fleet cannot reproduce — runner hardware rotates, so an absolute threshold recorded on one generation fails on the next for reasons that have nothing to do with the change under test. What CI *can* reproduce is the difference between two commits measured minutes apart on the same machine. Allocations carry the stricter bound because they are deterministic: every `allocs/op` measurement in this suite has a confidence interval of 0%, so a delta is always real. Wall time carries the looser one because it is not — spread reaches 21% on `EncodeOrJSON` even on an idle machine, and a tighter bound would buy flakes rather than sensitivity.
 
@@ -337,20 +337,28 @@ go test ./... -race -cover
 go vet ./... && gofmt -s -l .
 ```
 
-To run the benchmark gate locally the way CI runs it — measure the base, measure the branch, compare:
+To run the benchmark gate locally the way CI runs it — compile both sides, then measure them alternately:
 
 ```bash
 go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
 
 git worktree add /tmp/go-axi-base main
-(cd /tmp/go-axi-base && go test -run='^$' -bench=. -benchtime=100ms -count=6 . > /tmp/base.txt)
-go test -run='^$' -bench=. -benchtime=100ms -count=6 . > /tmp/head.txt
+(cd /tmp/go-axi-base && go test -c -o /tmp/base.test .)
+go test -c -o /tmp/head.test .
+
+: > /tmp/base.txt; : > /tmp/head.txt
+for i in 1 2 3 4 5 6; do
+  /tmp/base.test -test.run='^$' -test.bench=. -test.benchtime=100ms -test.count=1 >> /tmp/base.txt
+  /tmp/head.test -test.run='^$' -test.bench=. -test.benchtime=100ms -test.count=1 >> /tmp/head.txt
+done
 
 bash .github/benchgate.sh /tmp/base.txt /tmp/head.txt
 git worktree remove /tmp/go-axi-base
 ```
 
-`count=6` is the floor, not a preference: benchstat refuses a confidence interval below six samples and will not call a difference significant below four. Both thresholds are overridable for a one-off investigation — `TIME_THRESHOLD=5 ALLOC_THRESHOLD=0 bash .github/benchgate.sh ...` — but CI always uses the defaults.
+**Alternating is the point, not a detail.** Measuring all of one side and then all of the other puts each side in its own contiguous block, so any interference — a co-tenant VM, a throttle — skews every benchmark in whichever block it overlapped, and does so all at once. That is what a batch of benchmarks failing together means. Alternating denies interference the chance to land on one side only.
+
+`count=6` is the floor, not a preference: benchstat refuses a confidence interval below six samples and will not call a difference significant below four. Six rounds of `-test.count=1` give the same six samples per side at the same total cost. Both thresholds are overridable for a one-off investigation — `TIME_THRESHOLD=5 ALLOC_THRESHOLD=0 bash .github/benchgate.sh ...` — but CI always uses the defaults.
 
 ## License
 
