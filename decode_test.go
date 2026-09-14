@@ -473,3 +473,50 @@ func TestSynthesize_BufferGrowthDoesNotScaleWithRowCount(t *testing.T) {
 			delta, large, small, maxGrowthDelta, allocsSmall, allocsLarge)
 	}
 }
+
+// --- Tier 1 acceptance criterion: the Tier 1 win, measured whole
+
+// TestDecodeTabular_CostsLittleOverDecode is Tier 1's acceptance-criterion
+// test (AC 3 in the plan): DecodeTabular's own marginal cost, isolated by
+// comparing it against Decode() on the same payload in the same run — the
+// "ratio against a stable comparator" pattern output_test.go already uses for
+// EncodeOrJSON (TestEncodeOrJSON_GuardCostsLittleOverEncode) — must be lower
+// after Tier 1 than before it, and never an absolute ceiling
+// (sanitize_bench_test.go explains why absolute ceilings are hostage to the
+// runtime).
+//
+// This is deliberately a single-size measurement, not the marginal small-vs-
+// large comparison Tasks 2 and 3 use. Those two isolate ONE specific fix each
+// from every other cost in the function; this one is the acceptance
+// criterion for the whole of Tier 1 together, at a size a real findings
+// payload actually is (200 rows, matching TestEncodeOrJSON_GuardCostsLittleOverEncode's
+// own row count).
+//
+// WHY 3.5. Before Tier 1: 4.14 extra allocations/row over Decode() at this
+// size. After Tasks 1-3: 3.07. 3.5 sits between the two — it fails against
+// the pre-Tier-1 code and leaves room for legitimate small drift without
+// tolerating a regression back toward the original cost.
+func TestDecodeTabular_CostsLittleOverDecode(t *testing.T) {
+	const (
+		rows           = 200
+		maxPerRowAdded = 3.5
+	)
+
+	payload := cleanTabularFixture(rows)
+
+	decode := testing.AllocsPerRun(20, func() {
+		if _, err := Decode(strings.NewReader(payload)); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+	})
+	tabular := testing.AllocsPerRun(20, func() {
+		if _, err := DecodeTabular(strings.NewReader(payload)); err != nil {
+			t.Fatalf("DecodeTabular: %v", err)
+		}
+	})
+
+	if perRow := (tabular - decode) / float64(rows); perRow > maxPerRowAdded {
+		t.Errorf("DecodeTabular adds %.2f allocations per row over Decode() (%.0f vs %.0f "+
+			"over %d rows), want at most %.2f", perRow, tabular, decode, rows, maxPerRowAdded)
+	}
+}
