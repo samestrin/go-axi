@@ -51,6 +51,24 @@ TIME_THRESHOLD=${TIME_THRESHOLD:-15}
 # protects the "one allocation regardless of size" guarantee in the README.
 ALLOC_THRESHOLD=${ALLOC_THRESHOLD:-0}
 
+# Below this magnitude (seconds), a benchmark is measuring single-digit-to-low-
+# double-digit nanoseconds — close enough to the clock's own noise floor that a
+# percentage comparison stops meaning anything. Confirmed directly: comparing
+# BenchmarkSanitizeString/clean-short (2-3ns/op) against ITSELF, same binary, no
+# code change, on a quiet local machine, still swung ~22% between runs. On the
+# shared CI fleet this exact benchmark family (clean-short, clean-long) failed
+# the 15% gate three separate times in a row while carrying zero diff to
+# sanitize.go — always this family, never a microsecond-scale benchmark, which
+# is what points at magnitude rather than a real regression or a bad interleave.
+TINY_MAGNITUDE_SEC=${TINY_MAGNITUDE_SEC:-5e-8}
+
+# The loosened threshold used only below TINY_MAGNITUDE_SEC. Set with margin
+# above the worst false positive actually observed in CI (26.91%), the same way
+# TIME_THRESHOLD itself was set above its own observed noise ceiling. Still
+# tight enough to catch a regression that would matter at this scale (anything
+# doubling a nanosecond-scale op survives this easily).
+TINY_TIME_THRESHOLD=${TINY_TIME_THRESHOLD:-30}
+
 command -v benchstat >/dev/null 2>&1 || {
   echo "::error::benchstat not on PATH"
   exit 1
@@ -70,7 +88,9 @@ benchstat -format csv "$BASE" "$HEAD" 2>/dev/null > "$CSV"
 
 awk -F, \
   -v time_thr="$TIME_THRESHOLD" \
-  -v alloc_thr="$ALLOC_THRESHOLD" '
+  -v alloc_thr="$ALLOC_THRESHOLD" \
+  -v tiny_mag="$TINY_MAGNITUDE_SEC" \
+  -v tiny_thr="$TINY_TIME_THRESHOLD" '
   # Header row for a metric block, e.g. ",sec/op,CI,sec/op,CI,vs base,P".
   # Identified by the CI marker in column 3, which a filename row never has.
   $2 ~ /\/op$/ && $3 == "CI" { metric = $2; seen_metrics++; next }
@@ -113,8 +133,15 @@ awk -F, \
     # A negative delta is an improvement. Report it, never fail on it.
     if (pct + 0 < 0) { improved[++ni] = sprintf("  %-52s %-10s %s", name, metric, delta); next }
 
-    if (metric == "sec/op" && pct + 0 > time_thr + 0) {
-      failures[++nf] = sprintf("  %-52s %-10s %s  (limit +%s%%)", name, metric, delta, time_thr)
+    if (metric == "sec/op") {
+      # base is the CSV base-side value, e.g. "2.4255e-09" -- awk parses
+      # scientific notation as a number natively, no extra handling needed.
+      thr = (base + 0 > 0 && base + 0 < tiny_mag + 0) ? tiny_thr + 0 : time_thr + 0
+      if (pct + 0 > thr) {
+        failures[++nf] = sprintf("  %-52s %-10s %s  (limit +%s%%)", name, metric, delta, thr)
+      } else {
+        tolerated[++nt] = sprintf("  %-52s %-10s %s", name, metric, delta)
+      }
     } else if (metric == "allocs/op" && pct + 0 > alloc_thr + 0) {
       failures[++nf] = sprintf("  %-52s %-10s %s  (allocations must not grow)", name, metric, delta)
     } else {
