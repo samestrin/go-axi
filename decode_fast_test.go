@@ -61,6 +61,18 @@ func TestDecodeRowsFast_AgreesWithGeneric_TableDriven(t *testing.T) {
 		wantFastOK bool // explicit classification, on top of the DeepEqual check above
 	}{
 		{
+			// A clean `findings[0]:` review has zero rows. decodeRowsGeneric
+			// leaves doc.Rows nil in this case (its `var out` is never
+			// appended to); decodeRowsFast must agree exactly, not just on
+			// content but on nilness, since reflect.DeepEqual(nil, []T{})
+			// is false and JSON marshals them as null vs [] respectively.
+			name:       "zero rows stays nil, not an empty slice",
+			fields:     []string{"severity", "file", "problem", "fix"},
+			delim:      '|',
+			rows:       []string{},
+			wantFastOK: true,
+		},
+		{
 			name:       "clean unquoted rows",
 			fields:     []string{"severity", "file", "problem", "fix"},
 			delim:      '|',
@@ -265,6 +277,7 @@ func TestDecodeRowsFast_RandomizedAgreement(t *testing.T) {
 		`"ab"cd`, `ab"cd"`,
 		"a\\b",
 		"9007199254740993",
+		"NaN", "Infinity", "-Infinity", ".5", "-.5",
 	}
 	delims := []rune{'|', ',', '\t'}
 

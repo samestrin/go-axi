@@ -28,6 +28,14 @@ func decodeRowsFast(h *header, rows []string) ([]map[string]string, bool) {
 	// which fit in one byte, so truncating the rune to a byte is exact.
 	delim := byte(h.delimiter)
 
+	// decodeRowsGeneric leaves out nil when it appends zero rows (`var out
+	// []map[string]string`); returning a non-nil empty slice here for the same
+	// input would flip doc.Rows from nil to [] for a clean `findings[0]:`
+	// payload, breaking `Rows == nil` checks and JSON's null-vs-[] output.
+	if len(rows) == 0 {
+		return nil, true
+	}
+
 	out := make([]map[string]string, 0, len(rows))
 	for _, r := range rows {
 		content := strings.TrimSpace(r)
@@ -59,21 +67,22 @@ func decodeRowsFast(h *header, rows []string) ([]map[string]string, bool) {
 
 // fastSplitRow splits one row's trimmed content on delim, honouring quotes
 // exactly like toon-go's SplitInlineValues does when no escape ever fires
-// (guaranteed by the caller's backslash check below) -- a delimiter or a
-// colon byte inside quotes is not a boundary. It reports ok == false the
-// moment it sees anything the fast path must not handle: a backslash
-// anywhere (the eligibility line above), or an unquoted colon (toon-go's
-// generic decoder treats that as the row ending the array early, a rare
-// edge case left to the generic path rather than reimplemented here).
+// (guaranteed by the backslash check below) -- a delimiter or a colon byte
+// inside quotes is not a boundary. It reports ok == false the moment it sees
+// anything the fast path must not handle: a backslash anywhere (the
+// eligibility line above -- checked in the same pass as the split, rather
+// than as a separate pre-scan, since the only effect of finding one is an
+// immediate bail), or an unquoted colon (toon-go's generic decoder treats
+// that as the row ending the array early, a rare edge case left to the
+// generic path rather than reimplemented here).
 func fastSplitRow(content string, delim byte) ([]string, bool) {
-	if strings.IndexByte(content, '\\') != -1 {
-		return nil, false
-	}
 	var tokens []string
 	start := 0
 	inQuotes := false
 	for i := 0; i < len(content); i++ {
 		switch c := content[i]; {
+		case c == '\\':
+			return nil, false
 		case c == '"':
 			inQuotes = !inQuotes
 		case c == ':' && !inQuotes:
@@ -146,8 +155,10 @@ func hasForbiddenLeadingZerosFast(token string) bool {
 	if token[0] != '0' && (len(token) <= 1 || token[0] != '-' || token[1] != '0') {
 		return false
 	}
-	if strings.IndexByte(token, '.') != -1 || strings.IndexByte(token, 'e') != -1 || strings.IndexByte(token, 'E') != -1 {
-		return false
+	for i := 0; i < len(token); i++ {
+		if c := token[i]; c == '.' || c == 'e' || c == 'E' {
+			return false
+		}
 	}
 	if token[0] == '-' {
 		return len(token) > 2 && token[1] == '0' && isASCIIDigit(token[2])
