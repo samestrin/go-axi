@@ -4,6 +4,24 @@ All notable changes to this project are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major version is 0 the API is not frozen.
 
+## [v0.3.1] - 2026-09-15
+
+Performance only. No API change, and no observable behaviour change: `DecodeTabular`'s fast path is proven against the pre-existing generic decoder by a differential test suite that requires byte-for-byte agreement, and every row it cannot prove safe (an escape, an unquoted colon, a field-count mismatch) still falls back to that unchanged, proven path.
+
+### Performance
+
+Medians of six runs, `DecodeTabular` against v0.3.0, on a clean payload, an `atcr`-shaped payload (a quoted `"file:line"` column), and a payload with a backslash escape in every row that always falls back to the generic decoder.
+
+- Time: 74-81% less at 20 rows, 13-75% less at 500 rows. The escaped/fallback fixture improves too, because part of the win — a pooled scanner buffer — applies before the fast path is ever considered.
+- Memory: 73-91% less across every fixture and row count.
+- Allocations: 70-85% fewer on the clean and `atcr` fixtures; 6-8% fewer even on the fallback fixture.
+
+Three changes produced this, landing as PRs #21, #22, and #23:
+
+- A fast path builds `map[string]string` rows directly from the row text for any row with no backslash, skipping `toon-go`'s generic decoder — the `any`-boxing decode step and the `map[string]any` it builds per row — entirely. This covers plain rows and the `atcr` shape alike, since a quote with no escape inside it needs only its surrounding quote marks stripped, not a real unescape pass.
+- `DecodeTabular`'s scanner buffer (64KB, sized for large `PROBLEM`/`FIX` fields) now comes from a pool instead of being allocated fresh per call, which is most of the win at 20 rows, where that buffer used to dominate total memory.
+- The fast path reuses a token buffer across rows instead of allocating one per row, and skips a `ParseFloat`/`FormatFloat` round-trip for plain non-negative integers up to 15 digits, where it is mathematically guaranteed to be a no-op.
+
 ## [v0.3.0] - 2026-09-14
 
 Minor rather than patch because the API grows in three directions. Nothing is removed and no signature changes, so upgrading from v0.2.1 cannot produce a compile error.
@@ -121,6 +139,7 @@ First tagged release. Not a codec: toon-go encodes and decodes, and this is the 
 - `WriteHelp`, the one `help[]` form that survives its own codec.
 - `ExitCode`, one 0-4 set, as constants rather than prose in a style guide.
 
+[v0.3.1]: https://github.com/samestrin/go-axi/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/samestrin/go-axi/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/samestrin/go-axi/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/samestrin/go-axi/compare/v0.1.4...v0.2.0

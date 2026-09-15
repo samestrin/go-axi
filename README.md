@@ -1,17 +1,18 @@
 # go-axi
 
-> **Safe TOON output for Go command-line tools.** A hardening and guard layer over the official codec, [toon-go](https://github.com/toon-format/toon-go).
+> **Safe TOON output and input for Go command-line tools.** A hardening and guard layer over the official codec, [toon-go](https://github.com/toon-format/toon-go).
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/samestrin/go-axi.svg)](https://pkg.go.dev/github.com/samestrin/go-axi)
 [![Test](https://github.com/samestrin/go-axi/actions/workflows/test.yml/badge.svg)](https://github.com/samestrin/go-axi/actions/workflows/test.yml)
 [![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8)](https://go.dev/dl/)
 [![License](https://img.shields.io/github/license/samestrin/go-axi)](LICENSE)
 
-[TOON](https://toonformat.dev/) is the token-efficient output format behind [AXI](https://axi.md) principle 1, and `toon-go` is its official Go implementation. `toon-go` encodes and decodes. `go-axi` covers what an agent-facing CLI still has to get right before it prints:
+[TOON](https://toonformat.dev/) is the token-efficient output format behind [AXI](https://axi.md) principle 1, and `toon-go` is its official Go implementation. `toon-go` encodes and decodes. `go-axi` covers what an agent-facing CLI still has to get right before it prints, and when it reads TOON back in:
 
 - **Sanitize untrusted text.** Strip ANSI escapes, `U+2028`/`U+2029`, lone C1 bytes and invalid UTF-8 out of anything the tool did not author, without dropping the surrounding visible text.
 - **Catch silent encoding failures.** Some Go types encode to *empty output* instead of an error, so a command prints nothing and exits `0`. `Check` turns that into a condition a test can assert on.
 - **Know when TOON is not the cheaper choice.** `Check` measures the TOON payload against the JSON one and reports which is smaller.
+- **Read a tabular array back without losing what toon-go's public API can't return.** `DecodeTabular` keeps the declared field order, delimiter and row count, and handles a paginated payload correctly; `Decode` reads any other document, forwarding straight to toon-go.
 - **Ship one exit-code set and one `help[]` writer** as compiled constants instead of a convention in a style guide.
 
 ## Install
