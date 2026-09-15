@@ -259,6 +259,36 @@ func TestDecodeRowsFast_AgreesWithGeneric_TableDriven(t *testing.T) {
 	}
 }
 
+// TestDecodeRowsFast_MoreThanSixteenFields pins a real regression:
+// decodeRowsFast used a fixed [16]string array to avoid allocating a tokens
+// slice per document, but once sliced it as tokenArr[:len(h.fields)] before
+// checking whether len(h.fields) fit, which panics (slice bounds out of
+// range) for any header declaring more than 16 fields instead of falling
+// back to a heap-allocated slice. No existing fixture used more than a
+// handful of fields, so this went uncaught. A real header this wide is rare,
+// but must decline or decode correctly -- it must never crash the process.
+func TestDecodeRowsFast_MoreThanSixteenFields(t *testing.T) {
+	const numFields = 20
+	fields := make([]string, numFields)
+	tokens := make([]string, numFields)
+	for i := range fields {
+		fields[i] = fmt.Sprintf("f%d", i)
+		tokens[i] = fmt.Sprintf("v%d", i)
+	}
+	h := fastFixtureHeader(fields, '|')
+	rows := []string{row(strings.Join(tokens, "|"))}
+
+	fastOut, fastOK, _, _ := runBothDecoders(t, h, rows)
+	if !fastOK {
+		t.Fatalf("decodeRowsFast declined a valid %d-field row (out=%#v)", numFields, fastOut)
+	}
+	for i, field := range fields {
+		if fastOut[0][field] != tokens[i] {
+			t.Errorf("field %q = %q, want %q", field, fastOut[0][field], tokens[i])
+		}
+	}
+}
+
 // TestDecodeRowsFast_RandomizedAgreement is the "wide range of fixtures"
 // generator: it builds pseudo-random rows out of a pool that deliberately
 // includes every category from the table above (plain tokens, quoted-no-

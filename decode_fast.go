@@ -36,6 +36,14 @@ func decodeRowsFast(h *header, rows []string) ([]map[string]string, bool) {
 		return nil, true
 	}
 
+	var tokenArr [16]string
+	var tokens []string
+	if len(h.fields) <= len(tokenArr) {
+		tokens = tokenArr[:len(h.fields)]
+	} else {
+		tokens = make([]string, len(h.fields))
+	}
+
 	out := make([]map[string]string, 0, len(rows))
 	for _, r := range rows {
 		content := strings.TrimSpace(r)
@@ -48,8 +56,8 @@ func decodeRowsFast(h *header, rows []string) ([]map[string]string, bool) {
 			// must not assume that and silently disagree if it ever did.
 			return nil, false
 		}
-		tokens, ok := fastSplitRow(content, delim)
-		if !ok || len(tokens) != len(h.fields) {
+		n, ok := fastSplitRow(content, delim, tokens)
+		if !ok || n != len(h.fields) {
 			return nil, false
 		}
 		rowOut := make(map[string]string, len(h.fields))
@@ -65,38 +73,65 @@ func decodeRowsFast(h *header, rows []string) ([]map[string]string, bool) {
 	return out, true
 }
 
-// fastSplitRow splits one row's trimmed content on delim, honouring quotes
-// exactly like toon-go's SplitInlineValues does when no escape ever fires
+// fastSplitRow splits one row's trimmed content on delim into dst, honouring
+// quotes exactly like toon-go's SplitInlineValues does when no escape ever fires
 // (guaranteed by the backslash check below) -- a delimiter or a colon byte
-// inside quotes is not a boundary. It reports ok == false the moment it sees
-// anything the fast path must not handle: a backslash anywhere (the
-// eligibility line above -- checked in the same pass as the split, rather
-// than as a separate pre-scan, since the only effect of finding one is an
-// immediate bail), or an unquoted colon (toon-go's generic decoder treats
-// that as the row ending the array early, a rare edge case left to the
-// generic path rather than reimplemented here).
-func fastSplitRow(content string, delim byte) ([]string, bool) {
-	var tokens []string
+// inside quotes is not a boundary. It writes directly into dst to avoid slice
+// heap allocations, and reports ok == false the moment it sees anything the
+// fast path must not handle: a backslash anywhere, an unquoted colon, or more
+// fields than dst can hold.
+func fastSplitRow(content string, delim byte, dst []string) (int, bool) {
 	start := 0
 	inQuotes := false
+	count := 0
+	maxFields := len(dst)
 	for i := 0; i < len(content); i++ {
 		switch c := content[i]; {
 		case c == '\\':
-			return nil, false
+			return 0, false
 		case c == '"':
 			inQuotes = !inQuotes
 		case c == ':' && !inQuotes:
-			return nil, false
+			return 0, false
 		case c == delim && !inQuotes:
-			tokens = append(tokens, strings.TrimSpace(content[start:i]))
+			if count >= maxFields {
+				return 0, false
+			}
+			dst[count] = strings.TrimSpace(content[start:i])
+			count++
 			start = i + 1
 		}
 	}
 	if inQuotes {
-		return nil, false
+		return 0, false
 	}
-	tokens = append(tokens, strings.TrimSpace(content[start:]))
-	return tokens, true
+	if count >= maxFields {
+		return 0, false
+	}
+	dst[count] = strings.TrimSpace(content[start:])
+	count++
+	return count, true
+}
+
+func isASCIIDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// isPlainNonNegativeInt checks if token is a plain non-negative integer
+// (single '0', or 1-15 digits starting with '1'-'9'). For any such integer,
+// strconv.FormatFloat(float64(n), 'f', -1, 64) is mathematically guaranteed to
+// reproduce token identically, allowing ParseFloat and FormatFloat to be skipped.
+func isPlainNonNegativeInt(token string) bool {
+	if len(token) == 0 || len(token) > 15 {
+		return false
+	}
+	if token[0] == '0' {
+		return len(token) == 1
+	}
+	for i := 0; i < len(token); i++ {
+		if !isASCIIDigit(token[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // fastProjectToken merges decodePrimitiveToken and projectValue (both in
@@ -126,7 +161,14 @@ func fastProjectToken(token string) (string, bool) {
 	case "null":
 		return "null", true
 	}
+	first := token[0]
+	if (first < '0' || first > '9') && first != '-' {
+		return token, true
+	}
 	if hasForbiddenLeadingZerosFast(token) {
+		return token, true
+	}
+	if isPlainNonNegativeInt(token) {
 		return token, true
 	}
 	if looksNumericFast(token) {
@@ -211,5 +253,3 @@ func looksNumericFast(s string) bool {
 	}
 	return i == len(s)
 }
-
-func isASCIIDigit(b byte) bool { return b >= '0' && b <= '9' }

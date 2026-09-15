@@ -54,8 +54,8 @@ func BenchmarkDecodeTabular(b *testing.B) {
 	for _, name := range []string{"plain", "atcr", "escaped"} {
 		build := fixtures[name]
 		for _, n := range []int{20, 500} {
-			payload := build(n)
 			b.Run(name+"/rows="+strconv.Itoa(n), func(b *testing.B) {
+				payload := build(n)
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
 					if _, err := DecodeTabular(strings.NewReader(payload)); err != nil {
