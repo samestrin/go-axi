@@ -9,7 +9,7 @@
 
 [TOON](https://toonformat.dev/) is the token-efficient output format behind [AXI](https://axi.md) principle 1, and `toon-go` is its official Go implementation. `toon-go` encodes and decodes. `go-axi` covers what an agent-facing CLI still has to get right before it prints, and when it reads TOON back in:
 
-- **Sanitize untrusted text.** Strip ANSI escapes, `U+2028`/`U+2029`, bidi controls, zero-width characters, lone C1 bytes and invalid UTF-8 out of anything the tool did not author, without dropping the surrounding visible text.
+- **Sanitize untrusted text.** Strip ANSI escapes, `U+2028`/`U+2029`, every Unicode format character (bidi controls, zero-width and tag characters among them), lone C1 bytes and invalid UTF-8 out of anything the tool did not author, without dropping the surrounding visible text.
 - **Catch silent encoding failures.** Some Go types encode to *empty output* instead of an error, so a command prints nothing and exits `0`. `Check` turns that into a condition a test can assert on.
 - **Know when TOON is not the cheaper choice.** `Check` measures the TOON payload against the JSON one and reports which is smaller.
 - **Read a tabular array back without losing what toon-go's public API can't return.** `DecodeTabular` keeps the declared field order, delimiter and row count, and handles a paginated payload correctly; `Decode` reads any other document, forwarding straight to toon-go.
@@ -300,7 +300,7 @@ It compares two commits rather than checking against a stored baseline, because 
 
 | Gap in toon-go | What happens without a guard | go-axi |
 |---|---|---|
-| Passes `U+2028`/`U+2029`, invalid UTF-8, lone C1 bytes (`0x9B`, `0x9D`), bidi controls and zero-width characters through | A payload carrying a raw escape sequence reaches whatever terminal renders it, and a bidi override can reorder what a reader sees (Trojan Source) | `Sanitize` |
+| Passes `U+2028`/`U+2029`, invalid UTF-8, lone C1 bytes (`0x9B`, `0x9D`) and Unicode format characters (bidi controls, zero-width and tag characters) through | A payload carrying a raw escape sequence reaches whatever terminal renders it, and a bidi override can reorder what a reader sees (Trojan Source) | `Sanitize` |
 | Supports neither defined string types nor `encoding.TextMarshaler`, and does not error on them | **Empty output.** The command prints nothing and exits `0` | `Check` |
 | Reference cycles reach the encoder | Stack exhaustion kills the process; `recover()` cannot catch it | `Sanitize`, `Check` |
 | Size relative to JSON is not reported | A command pays more tokens as TOON than it would as JSON | `Check.Efficient` |
