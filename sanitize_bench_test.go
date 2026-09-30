@@ -71,7 +71,7 @@ func BenchmarkSanitizeString(b *testing.B) {
 	cases := []struct{ name, in string }{
 		{"clean-short", "hello"},
 		{"clean-long", "a fairly ordinary sentence of the sort a CLI emits all day"},
-		// Every rune here is non-ASCII, so each one goes through unsafeRune.
+		// Every letter here is non-ASCII, so each one goes through unsafeRune.
 		{"clean-non-ascii", "naïve café — 日本語のテキスト ✓ Ελληνικά"},
 		{"dirty-first-byte", "\x1b[31mred"},
 		{"dirty-last-byte", "a fairly ordinary sentence that only goes wrong at the end\x1b"},
