@@ -4,7 +4,17 @@ All notable changes to this project are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major version is 0 the API is not frozen.
 
-## [v0.3.1] - 2026-09-15
+## [v0.3.2] - 2026-09-30
+
+Patch rather than minor because the API does not change. The output does: `Sanitize` and `SanitizeString` now strip more characters, so a consumer's TOON output can differ from v0.3.1 wherever the input carried one of them.
+
+### Security
+
+- `Sanitize` and `SanitizeString` strip bidi controls (`U+061C`, `U+200E`, `U+200F`, `U+202A`–`U+202E`, `U+2066`–`U+2069`) and zero-width characters (`U+200B`–`U+200D`, `U+2060`, `U+FEFF`). They are Unicode category Cf, not Cc, so the `unicode.IsControl` check missed them, and toon-go passes all of them through without an error. Untrusted text could use them to reorder or hide content when the output is shown in a terminal, editor or `git diff` (the Trojan Source class). Like every other stripped character, they are removed rather than replaced, so the text on each side joins.
+- Stripping `U+200C` and `U+200D` also splits joined emoji sequences into their parts, and changes how some Persian and Indic words render. The text stays readable.
+- Two map keys that differ only by one of these characters now return `*KeyCollisionError`, because they look identical to a reader.
+- A file written before this release keeps any of these characters it already has. Only new output is cleaned.
+
 
 Performance only. No API change, and no observable behaviour change: `DecodeTabular`'s fast path is proven against the pre-existing generic decoder by a differential test suite that requires byte-for-byte agreement, and every row it cannot prove safe (an escape, an unquoted colon, a field-count mismatch) still falls back to that unchanged, proven path.
 
@@ -139,6 +149,7 @@ First tagged release. Not a codec: toon-go encodes and decodes, and this is the 
 - `WriteHelp`, the one `help[]` form that survives its own codec.
 - `ExitCode`, one 0-4 set, as constants rather than prose in a style guide.
 
+[v0.3.2]: https://github.com/samestrin/go-axi/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/samestrin/go-axi/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/samestrin/go-axi/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/samestrin/go-axi/compare/v0.2.0...v0.2.1

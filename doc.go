@@ -6,9 +6,10 @@
 // CLI has to get right before it prints or reads:
 //
 //   - Sanitize: hostile input handling. toon-go rejects control bytes below
-//     0x20 with an error but passes U+2028/U+2029, invalid UTF-8, and lone C1
-//     bytes straight through. A payload carrying a raw ANSI escape reaches the
-//     terminal that renders it.
+//     0x20 with an error but passes U+2028/U+2029, invalid UTF-8, lone C1
+//     bytes, bidi controls and zero-width characters straight through. A
+//     payload carrying a raw ANSI escape reaches the terminal that renders it,
+//     and one carrying a bidi override can reorder what a reader sees.
 //
 //   - Check: toon-go supports neither defined string types nor
 //     encoding.TextMarshaler, and a violating type does not error — it emits

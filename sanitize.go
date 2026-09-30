@@ -116,6 +116,8 @@ var pathPool = sync.Pool{
 //     handed reviewer text containing colour codes emits nothing at all.
 //   - U+2028, U+2029, lone C1 bytes (0x9b, 0x9d) and invalid UTF-8 pass through
 //     untouched, reaching whatever terminal renders the output.
+//   - Bidi controls and zero-width characters pass through too. They let text
+//     reorder or hide itself when shown in a terminal, editor or diff.
 //
 // Sanitizing before encoding fixes both: the encoder never sees a byte it would
 // reject, and never sees one it would forward.
