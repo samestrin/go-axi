@@ -116,6 +116,10 @@ var pathPool = sync.Pool{
 //     handed reviewer text containing colour codes emits nothing at all.
 //   - U+2028, U+2029, lone C1 bytes (0x9b, 0x9d) and invalid UTF-8 pass through
 //     untouched, reaching whatever terminal renders the output.
+//   - Unicode format characters (category Cf) pass through too. Bidi controls
+//     and zero-width characters let text reorder or hide itself when shown in
+//     a terminal, editor or diff, and tag characters carry text a human cannot
+//     see.
 //
 // Sanitizing before encoding fixes both: the encoder never sees a byte it would
 // reject, and never sees one it would forward.
@@ -524,12 +528,63 @@ func cleanFrom(s string, i int) string {
 // not "control" characters, so unicode.IsControl returns false for both. A
 // sanitizer relying on IsControl alone passes them straight through — which is
 // exactly what toon-go does today.
+//
+// Format characters (category Cf) are checked for the same reason: they are not
+// Cc, so IsControl misses them too. The category holds the bidi controls and
+// zero-width characters that let text reorder or hide itself when shown in a
+// terminal, editor or diff (the Trojan Source class), and the tag characters
+// that carry text a human cannot see. The whole category is stripped rather
+// than a list of known offenders, so a rune Unicode adds to it later is covered.
+// Stripping U+200C and U+200D also breaks joined emoji sequences and some
+// Persian and Indic spellings; the text stays readable, and hidden content is
+// the worse outcome.
+//
+// Tab, newline and carriage return are valid TOON escapes that toon-go handles
+// correctly, so they are never marked.
 func unsafeRune(r rune) bool {
-	switch r {
-	case '\n', '\r', '\t':
-		return false // valid TOON escapes; toon-go handles these correctly
-	case '\u2028', '\u2029':
-		return true
+	if uint32(r) < 0x20000 {
+		return unsafeLow[uint32(r)>>6]&(1<<(r&63)) != 0
 	}
-	return unicode.IsControl(r)
+	return r>>8 == 0xe00 && unsafeTags[uint8(r)>>6]&(1<<(r&63)) != 0
+}
+
+// unsafeLow and unsafeTags mark every rune unsafeRune rejects, so the check is
+// one table lookup that the compiler inlines into the scan loops. Searching
+// unicode.Cf directly made clean non-ASCII text 2.5x slower to scan.
+//
+// Both are built from unicode.Cf rather than typed out. Every format character
+// sits in planes 0 and 1 (unsafeLow) or in U+E0000-U+E00FF (unsafeTags). If a
+// later Unicode version adds one anywhere else, init cannot mark it, and
+// TestSanitizeString_StripsEveryFormatRune fails.
+var (
+	unsafeLow  [0x20000 / 64]uint64
+	unsafeTags [0x100 / 64]uint64
+)
+
+func init() {
+	mark := func(r rune) {
+		switch {
+		case r < 0x20000:
+			unsafeLow[r>>6] |= 1 << (r & 63)
+		case r>>8 == 0xe00:
+			unsafeTags[uint8(r)>>6] |= 1 << (r & 63)
+		}
+	}
+	for r := rune(0); r <= 0x9f; r++ {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			mark(r)
+		}
+	}
+	mark('\u2028')
+	mark('\u2029')
+	for _, rng := range unicode.Cf.R16 {
+		for r := rune(rng.Lo); r <= rune(rng.Hi); r += rune(rng.Stride) {
+			mark(r)
+		}
+	}
+	for _, rng := range unicode.Cf.R32 {
+		for r := rune(rng.Lo); r <= rune(rng.Hi); r += rune(rng.Stride) {
+			mark(r)
+		}
+	}
 }

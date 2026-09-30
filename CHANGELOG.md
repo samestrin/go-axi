@@ -4,6 +4,24 @@ All notable changes to this project are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major version is 0 the API is not frozen.
 
+## [v0.4.0] - 2026-09-30
+
+Minor rather than patch. No signature changes, but `Sanitize` and `SanitizeString` now strip more characters, so output can differ from v0.3.1, and a map that encoded under v0.3.1 can now return `*KeyCollisionError` (see below).
+
+### Security
+
+- `Sanitize` and `SanitizeString` strip every Unicode format character (category Cf, 170 code points in Go 1.26's tables). These include the bidi controls (`U+061C`, `U+200E`, `U+200F`, `U+202A`–`U+202E`, `U+2066`–`U+2069`), the zero-width characters (`U+200B`–`U+200D`, `U+2060`, `U+FEFF`), and the tag characters (`U+E0001`, `U+E0020`–`U+E007F`). None is category Cc, so the `unicode.IsControl` check missed all of them, and toon-go passes all of them through without an error. Untrusted text could use them to reorder or hide content when the output is shown in a terminal, editor or `git diff` (the Trojan Source class), or use tag characters to carry text a human cannot see but an agent reads. Like every other stripped character, they are removed rather than replaced, so the text on each side joins. The check reads the category from Go's `unicode` tables, so a character Unicode adds to it later is covered too.
+
+### Changed
+
+- Two map keys that differ only by a format character now clean to the same key and return `*KeyCollisionError`, and `MustSanitize` panics on them. Most such pairs are spoofs, but not all: two Persian or Indic keys that differ only by `U+200C` can be different words, and two emoji keys can differ only by `U+200D`. A map like that encoded under v0.3.1 and now fails.
+- Stripping `U+200C` and `U+200D` in values also splits joined emoji sequences into their parts, and changes how some Persian and Indic words render. The text stays readable. Stripping tag characters turns subdivision flags (England, Scotland, Wales) into a plain black flag.
+- Output produced before this release keeps any of these characters it already had. Only new output is cleaned.
+
+### Performance
+
+The check is a table lookup built from `unicode.Cf` at package load, so it stays inlined in the scan loop. Measured against v0.3.1, alternating, six to eight runs: clean non-ASCII text 6-7% faster, clean ASCII strings 8-9% slower (under 2 ns on a 58-byte string), no change in allocations. The tables add 16.4 KB of zeroed memory.
+
 ## [v0.3.1] - 2026-09-15
 
 Performance only. No API change, and no observable behaviour change: `DecodeTabular`'s fast path is proven against the pre-existing generic decoder by a differential test suite that requires byte-for-byte agreement, and every row it cannot prove safe (an escape, an unquoted colon, a field-count mismatch) still falls back to that unchanged, proven path.
@@ -139,6 +157,7 @@ First tagged release. Not a codec: toon-go encodes and decodes, and this is the 
 - `WriteHelp`, the one `help[]` form that survives its own codec.
 - `ExitCode`, one 0-4 set, as constants rather than prose in a style guide.
 
+[v0.4.0]: https://github.com/samestrin/go-axi/compare/v0.3.1...v0.4.0
 [v0.3.1]: https://github.com/samestrin/go-axi/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/samestrin/go-axi/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/samestrin/go-axi/compare/v0.2.0...v0.2.1

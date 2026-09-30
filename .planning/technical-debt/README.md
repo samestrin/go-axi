@@ -46,6 +46,14 @@ Second pass over `db54cc11`, because pass 1 reviewed an earlier commit and never
 | 4 | [ ] | LOW | check_test.go:106 | The comment reads "60 layers clears a cap of 100 with margin", mixing layer-units with walk-depth units — each `[]any` layer costs two levels of walk depth. The claim is true but its arithmetic is invisible, and the probe table immediately above gives the real boundary at 50 layers. | State it in one unit: 60 layers is 120 levels of walk depth, which clears the old cap of 100. | docs | 5 | self-review | self | HIGH |
 | 4 | [ ] | LOW | output_test.go:558 | `losslessRows` duplicates `benchRows(n, false)` at `sanitize_bench_test.go:21`. Two near-identical uniform row fixtures now exist in the same package, differing only in that `losslessRows` adds the scalar `path` and `total` keys a real listing carries. | Keep one. `benchRows` already takes a dirty flag, so extend it with the scalar keys and delete `losslessRows`, or move the other way — but not both. | duplication | 15 | self-review | self | HIGH |
 
+### [2026-09-30] From Review: fix/sanitize-bidi-zero-width, atcr panel + own pass
+
+Branch `fix/sanitize-bidi-zero-width` (v0.4.0). atcr returned 25 findings reconciled to 11 (0 critical, 4 HIGH, 6 MEDIUM, 1 LOW), 11 of 13 agents. All HIGH and MEDIUM findings were fixed on the branch. The strongest one, also raised in my own pass, was that a hand-typed list of 17 runes left the rest of Unicode category Cf in place, including the tag characters used to hide text from a human reader. The fix now strips the whole category. pace's LOW ("security rationale not reflected in code or docs") is wrong: the rationale is in the `unsafeRune` comment and the v0.4.0 CHANGELOG entry, so it is not filed.
+
+| Group | | Severity | File | Problem | Fix | Category | Est Minutes | Source | Reviewers | Confidence |
+|-------|---|----------|------|---------|-----|----------|-------------|--------|-----------|------------|
+| 15 | [ ] | LOW | sanitize.go:542 | `unsafeRune` returns true for runes that must be removed, but "unsafe" suggests the rune is unsafe to process rather than that it gets stripped. The name predates this branch. | Rename to `strippedRune` or `mustStrip`, together with `unsafeLow` and `unsafeTags`. Mechanical, unexported. | naming | 5 | atcr-panel | otto | MEDIUM |
+
 ## Stats
 
 | Severity | Open | Deferred | Resolved |
@@ -53,9 +61,9 @@ Second pass over `db54cc11`, because pass 1 reviewed an earlier commit and never
 | CRITICAL | 0 | 0 | 0 |
 | HIGH | 0 | 0 | 0 |
 | MEDIUM | 2 | 1 | 0 |
-| LOW | 20 | 0 | 2 |
+| LOW | 21 | 0 | 2 |
 
-**Last Modified:** 2026-09-14 | **Open Items:** 22 | **Deferred Items:** 1 | **Resolved Items:** 2 | **Total Items:** 25
+**Last Modified:** 2026-09-30 | **Open Items:** 23 | **Deferred Items:** 1 | **Resolved Items:** 2 | **Total Items:** 26
 
 Counted with `awk`, not by hand. Three separate attempts to tally this table by eye produced wrong numbers — 6 versus 5 open MEDIUM the first time, then 11/5/17 against the real 13/4/18 — so the count is now always taken from the file rather than from memory of what was added.
 
