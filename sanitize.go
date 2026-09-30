@@ -524,11 +524,24 @@ func cleanFrom(s string, i int) string {
 // not "control" characters, so unicode.IsControl returns false for both. A
 // sanitizer relying on IsControl alone passes them straight through — which is
 // exactly what toon-go does today.
+//
+// Bidi controls and zero-width characters are checked explicitly for the same
+// reason: they are category Cf, not Cc, so IsControl misses them too. They let
+// text reorder or hide itself when shown in a terminal, editor or diff (the
+// Trojan Source class). Stripping U+200C and U+200D also breaks joined emoji
+// sequences and some Persian and Indic spellings; the text stays readable, and
+// hidden content is the worse outcome.
 func unsafeRune(r rune) bool {
 	switch r {
 	case '\n', '\r', '\t':
 		return false // valid TOON escapes; toon-go handles these correctly
-	case '\u2028', '\u2029':
+	case '\u2028', '\u2029',
+		// Bidi controls: marks, embeddings, overrides and isolates.
+		'\u061c', '\u200e', '\u200f',
+		'\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+		'\u2066', '\u2067', '\u2068', '\u2069',
+		// Zero-width characters.
+		'\u200b', '\u200c', '\u200d', '\u2060', '\ufeff':
 		return true
 	}
 	return unicode.IsControl(r)
